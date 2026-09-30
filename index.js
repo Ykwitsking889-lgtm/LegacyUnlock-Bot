@@ -21,39 +21,46 @@ const {
     Collection
 } = require("discord.js");
 
-/* =========================================================
-   CONFIG
-========================================================= */
-
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const OWNER_ID = process.env.OWNER_ID;
 
 if (!TOKEN || !CLIENT_ID || !OWNER_ID) {
-    console.error("Missing DISCORD_TOKEN, CLIENT_ID, or OWNER_ID in .env");
+    console.error("Missing DISCORD_TOKEN, CLIENT_ID, or OWNER_ID.");
+    console.error("Required environment variables:");
+    console.error("DISCORD_TOKEN");
+    console.error("CLIENT_ID");
+    console.error("OWNER_ID");
     process.exit(1);
 }
 
 const CONFIG = {
     botName: "LegacyUnlock",
-
     ticketCategoryName: "Tickets",
     applicationCategoryName: "Applications",
-
     supportRoleName: "Support Team",
     adminRoleName: "Admin",
     moderatorRoleName: "Moderator",
-
     logChannelName: "bot-logs",
-
     minimumPassingScore: 5.5,
-
     maxApplicationQuestions: 10
 };
 
-/* =========================================================
-   CLIENT
-========================================================= */
+const SECURITY = {
+    antiSpam: true,
+    antiLinks: true,
+    antiSlurs: true,
+    antiRaid: true,
+    antiNuke: true,
+    spamMessageLimit: 6,
+    spamTimeWindow: 5000,
+    raidJoinLimit: 8,
+    raidTimeWindow: 10000,
+    punishment: "timeout",
+    timeoutMinutes: 10,
+    deleteBadMessages: true,
+    logSecurityEvents: true
+};
 
 const client = new Client({
     intents: [
@@ -71,15 +78,81 @@ const client = new Client({
 
 client.commands = new Collection();
 
-/* =========================================================
-   APPLICATION DATA
-========================================================= */
-
 const applications = new Map();
+const welcomeChannels = new Map();
+const spamTracker = new Map();
+const joinTracker = new Map();
+const ticketOwners = new Map();
+const ticketClaims = new Map();
+const warnings = new Map();
+const securityActions = new Collection();
 
-/* =========================================================
-   HELPERS
-========================================================= */
+const BLOCKED_WORDS = [
+    "nigger",
+    "nigga",
+    "faggot",
+    "fag",
+    "retard",
+    "tranny",
+    "dyke",
+    "nka",
+    "nca",
+    "ncr"
+];
+
+const LINK_REGEX =
+    /(https?:\/\/|www\.|discord\.gg\/|discord\.com\/invite\/)/i;
+
+const ROLE_TESTS = {
+    tester: [
+        "What makes a good Discord community tester?",
+        "How would you report a bug?",
+        "What information should a bug report contain?",
+        "What would you do if you discovered an exploit?",
+        "How would you test a new feature?",
+        "How do you reproduce a bug?",
+        "Why is testing important?",
+        "How would you handle a bug that only happens sometimes?",
+        "What would you do if another tester disagreed with your report?",
+        "Why should we choose you as a tester?"
+    ],
+    moderator: [
+        "What makes a good moderator?",
+        "How would you handle an argument?",
+        "What would you do if a member broke a rule?",
+        "How should warnings be handled?",
+        "What would you do if someone insulted you?",
+        "How would you handle spam?",
+        "What is abuse of moderator permissions?",
+        "When should you escalate an issue?",
+        "How should private moderation information be handled?",
+        "Why should we choose you as a moderator?"
+    ],
+    support: [
+        "What makes good support?",
+        "How would you respond to an angry user?",
+        "What would you do if you did not know the answer?",
+        "How should support tickets be handled?",
+        "Why is communication important?",
+        "How would you handle multiple tickets?",
+        "What information should remain private?",
+        "When should an issue be escalated?",
+        "How would you deal with a rude user?",
+        "Why should we choose you for support?"
+    ],
+    developer: [
+        "What programming languages do you know?",
+        "How do you debug an error?",
+        "How do you keep code organized?",
+        "What is version control?",
+        "How do you handle a bug in production?",
+        "Why is security important?",
+        "How do you test code?",
+        "How would you explain a technical issue to a non-technical user?",
+        "How do you handle code review?",
+        "Why should we choose you as a developer?"
+    ]
+};
 
 function isOwner(interaction) {
     return interaction.user.id === OWNER_ID;
@@ -88,7 +161,7 @@ function isOwner(interaction) {
 function hasAdmin(interaction) {
     return (
         isOwner(interaction) ||
-        interaction.member.permissions.has(
+        interaction.member?.permissions?.has(
             PermissionsBitField.Flags.Administrator
         )
     );
@@ -97,20 +170,40 @@ function hasAdmin(interaction) {
 function hasModeration(interaction) {
     return (
         isOwner(interaction) ||
-        interaction.member.permissions.has(
+        interaction.member?.permissions?.has(
             PermissionsBitField.Flags.ModerateMembers
         )
     );
 }
 
-async function getOrCreateRole(guild, roleName, color = null) {
+function isStaff(member) {
+    if (!member) return false;
+
+    if (
+        member.id === OWNER_ID ||
+        member.permissions.has(PermissionsBitField.Flags.Administrator) ||
+        member.permissions.has(PermissionsBitField.Flags.ManageGuild)
+    ) {
+        return true;
+    }
+
+    return member.roles.cache.some(role =>
+        [
+            CONFIG.supportRoleName,
+            CONFIG.adminRoleName,
+            CONFIG.moderatorRoleName
+        ].includes(role.name)
+    );
+}
+
+async function getOrCreateRole(guild, name, color) {
     let role = guild.roles.cache.find(
-        r => r.name.toLowerCase() === roleName.toLowerCase()
+        r => r.name.toLowerCase() === name.toLowerCase()
     );
 
     if (!role) {
         role = await guild.roles.create({
-            name: roleName,
+            name,
             color: color || undefined,
             reason: "LegacyUnlock automatic setup"
         });
@@ -121,15 +214,16 @@ async function getOrCreateRole(guild, roleName, color = null) {
 
 async function getOrCreateCategory(guild, name) {
     let category = guild.channels.cache.find(
-        c =>
-            c.type === ChannelType.GuildCategory &&
-            c.name.toLowerCase() === name.toLowerCase()
+        channel =>
+            channel.type === ChannelType.GuildCategory &&
+            channel.name.toLowerCase() === name.toLowerCase()
     );
 
     if (!category) {
         category = await guild.channels.create({
             name,
-            type: ChannelType.GuildCategory
+            type: ChannelType.GuildCategory,
+            reason: "LegacyUnlock automatic setup"
         });
     }
 
@@ -140,13 +234,14 @@ async function getOrCreateLogChannel(guild) {
     let channel = guild.channels.cache.find(
         c =>
             c.type === ChannelType.GuildText &&
-            c.name.toLowerCase() === CONFIG.logChannelName
+            c.name.toLowerCase() === CONFIG.logChannelName.toLowerCase()
     );
 
     if (!channel) {
         channel = await guild.channels.create({
             name: CONFIG.logChannelName,
-            type: ChannelType.GuildText
+            type: ChannelType.GuildText,
+            reason: "LegacyUnlock logging setup"
         });
     }
 
@@ -169,88 +264,26 @@ async function sendLog(guild, title, description, color = 0x5865F2) {
     }
 }
 
-function safeChannelName(text) {
-    return text
+function safeChannelName(value) {
+    return value
         .toLowerCase()
         .replace(/[^a-z0-9-]/g, "-")
         .replace(/-+/g, "-")
         .slice(0, 80);
 }
 
-/* =========================================================
-   APPLICATION QUESTIONS
-========================================================= */
-
-const ROLE_TESTS = {
-    tester: [
-        "What makes a good Discord community tester?",
-        "How would you report a bug?",
-        "What information should a bug report contain?",
-        "What would you do if you discovered an exploit?",
-        "How would you test a new feature?",
-        "How do you reproduce a bug?",
-        "Why is testing important?",
-        "How would you handle a bug that only happens sometimes?",
-        "What would you do if another tester disagreed with your report?",
-        "Why should we choose you as a tester?"
-    ],
-
-    moderator: [
-        "What makes a good moderator?",
-        "How would you handle an argument?",
-        "What would you do if a member broke a rule?",
-        "How should warnings be handled?",
-        "What would you do if someone insulted you?",
-        "How would you handle spam?",
-        "What is abuse of moderator permissions?",
-        "When should you escalate an issue?",
-        "How should private moderation information be handled?",
-        "Why should we choose you as a moderator?"
-    ],
-
-    support: [
-        "What makes good support?",
-        "How would you respond to an angry user?",
-        "What would you do if you did not know the answer?",
-        "How should support tickets be handled?",
-        "Why is communication important?",
-        "How would you handle multiple tickets?",
-        "What information should remain private?",
-        "When should an issue be escalated?",
-        "How would you deal with a rude user?",
-        "Why should we choose you for support?"
-    ],
-
-    developer: [
-        "What programming languages do you know?",
-        "How do you debug an error?",
-        "How do you keep code organized?",
-        "What is version control?",
-        "How do you handle a bug in production?",
-        "Why is security important?",
-        "How do you test code?",
-        "How would you explain a technical issue to a non-technical user?",
-        "How do you handle code review?",
-        "Why should we choose you as a developer?"
-    ]
-};
-
-/* =========================================================
-   SIMPLE ANSWER RATING ENGINE
-========================================================= */
-
 function rateAnswer(answer) {
-    if (!answer || answer.trim().length === 0) {
+    if (!answer || !answer.trim()) {
         return 1;
     }
 
-    const text = answer.trim();
+    const value = answer.trim();
 
     let score = 1;
 
-    if (text.length >= 20) score += 1;
-    if (text.length >= 50) score += 1;
-    if (text.length >= 100) score += 1;
+    if (value.length >= 20) score += 1;
+    if (value.length >= 50) score += 1;
+    if (value.length >= 100) score += 1;
 
     const usefulWords = [
         "because",
@@ -272,36 +305,97 @@ function rateAnswer(answer) {
     ];
 
     for (const word of usefulWords) {
-        if (text.toLowerCase().includes(word)) {
+        if (value.toLowerCase().includes(word)) {
             score += 0.25;
         }
     }
 
-    score = Math.min(10, Math.round(score * 4) / 4);
-
-    return score;
+    return Math.min(10, Math.round(score * 4) / 4);
 }
 
-/* =========================================================
-   COMMANDS
-========================================================= */
+function containsBlockedWord(content) {
+    const lower = content
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N}\s]/gu, " ");
+
+    return BLOCKED_WORDS.some(word => {
+        const regex = new RegExp(`(^|\\s)${word}(?=\\s|$)`, "i");
+        return regex.test(lower);
+    });
+}
+
+function containsLink(content) {
+    return LINK_REGEX.test(content);
+}
+
+async function punishSecurityUser(member, reason) {
+    if (!member) return;
+
+    if (
+        member.id === OWNER_ID ||
+        member.permissions.has(PermissionsBitField.Flags.Administrator)
+    ) {
+        return;
+    }
+
+    try {
+        if (
+            SECURITY.punishment === "timeout" &&
+            member.moderatable
+        ) {
+            await member.timeout(
+                SECURITY.timeoutMinutes * 60 * 1000,
+                reason
+            );
+            return;
+        }
+
+        if (
+            SECURITY.punishment === "kick" &&
+            member.kickable
+        ) {
+            await member.kick(reason);
+        }
+    } catch (error) {
+        console.error("Security punishment error:", error);
+    }
+}
+
+async function securityLog(guild, title, description) {
+    if (!SECURITY.logSecurityEvents) return;
+
+    await sendLog(
+        guild,
+        `Security | ${title}`,
+        description,
+        0xED4245
+    );
+}
+
+function commandError(interaction, message) {
+    const payload = {
+        content: `❌ ${message}`,
+        ephemeral: true
+    };
+
+    if (interaction.replied || interaction.deferred) {
+        return interaction.followUp(payload).catch(() => {});
+    }
+
+    return interaction.reply(payload).catch(() => {});
+}
 
 const commands = [
-
-    /* =========================
-       GENERAL
-    ========================= */
-
-new SlashCommandBuilder()
-    .setName("setwelcome")
-    .setDescription("Set the channel for automatic welcome messages")
-    .addChannelOption(option =>
-        option
-            .setName("channel")
-            .setDescription("Channel where welcome messages will be sent")
-            .addChannelTypes(ChannelType.GuildText)
-            .setRequired(true)
-    ),
+    new SlashCommandBuilder()
+        .setName("setwelcome")
+        .setDescription("Set the channel for automatic welcome messages")
+        .addChannelOption(option =>
+            option
+                .setName("channel")
+                .setDescription("Channel where welcome messages will be sent")
+                .addChannelTypes(ChannelType.GuildText)
+                .setRequired(true)
+        ),
 
     new SlashCommandBuilder()
         .setName("ping")
@@ -338,10 +432,6 @@ new SlashCommandBuilder()
     new SlashCommandBuilder()
         .setName("help")
         .setDescription("Show bot commands"),
-
-    /* =========================
-       MODERATION
-    ========================= */
 
     new SlashCommandBuilder()
         .setName("kick")
@@ -437,10 +527,6 @@ new SlashCommandBuilder()
                 .setRequired(true)
         ),
 
-    /* =========================
-       TICKETS
-    ========================= */
-
     new SlashCommandBuilder()
         .setName("ticketpanel")
         .setDescription("Create the ticket panel"),
@@ -461,10 +547,6 @@ new SlashCommandBuilder()
         .setName("ticketclaim")
         .setDescription("Claim the current ticket"),
 
-    /* =========================
-       APPLICATIONS
-    ========================= */
-
     new SlashCommandBuilder()
         .setName("apply")
         .setDescription("Start a staff application"),
@@ -476,10 +558,6 @@ new SlashCommandBuilder()
     new SlashCommandBuilder()
         .setName("applications")
         .setDescription("View application system information"),
-
-    /* =========================
-       OWNER
-    ========================= */
 
     new SlashCommandBuilder()
         .setName("setup")
@@ -495,2542 +573,7 @@ new SlashCommandBuilder()
 
     new SlashCommandBuilder()
         .setName("setupapplications")
-        .setDescription("Set up the application system")
-];
-
-/* =========================================================
-   COMMAND REGISTRATION
-========================================================= */
-async function registerCommands() {
-    try {
-        const rest = new REST({ version: "10" }).setToken(TOKEN);
-
-        // Remove duplicate command names
-        const uniqueCommands = [];
-        const seen = new Set();
-
-        for (const command of commands) {
-            const data = command.toJSON();
-
-            if (seen.has(data.name)) {
-                console.log(`Removed duplicate command: /${data.name}`);
-                continue;
-            }
-
-            seen.add(data.name);
-            uniqueCommands.push(data);
-        }
-
-        console.log(
-            `Registering ${uniqueCommands.length} unique GLOBAL slash commands...`
-        );
-
-        await rest.put(
-            Routes.applicationCommands(CLIENT_ID),
-            {
-                body: uniqueCommands
-            }
-        );
-
-        console.log(
-            `Successfully registered ${uniqueCommands.length} unique global commands.`
-        );
-
-    } catch (error) {
-        console.error("Command registration failed:", error);
-    }
-}
-
-/* =========================================================
-   READY
-========================================================= */
-
-client.once("ready", async () => {
-
-    console.log("======================================");
-    console.log(`${CONFIG.botName} is ONLINE`);
-    console.log(`Logged in as: ${client.user.tag}`);
-    console.log(`Servers: ${client.guilds.cache.size}`);
-    console.log(`Commands: ${commands.length}`);
-    console.log("======================================");
-
-    client.user.setPresence({
-        activities: [
-            {
-                name: "Tickets & Applications",
-                type: 3
-            }
-        ],
-        status: "online"
-    });
-
-    await registerCommands();
-
-    for (const guild of client.guilds.cache.values()) {
-        try {
-            await getOrCreateLogChannel(guild);
-        } catch (error) {
-            console.error(
-                `Could not create log channel in ${guild.name}`,
-                error.message
-            );
-        }
-    }
-});
-
-/* =========================================================
-   INTERACTION HANDLER
-========================================================= */
-
-client.on("interactionCreate", async interaction => {
-
-    try {
-
-        /* =================================================
-           SLASH COMMANDS
-        ================================================= */
-
-        if (interaction.isChatInputCommand()) {
-
-            const command = interaction.commandName;
-
-            /* =========================
-               GENERAL
-            ========================= */
-
-if (command === "setwelcome") {
-
-    if (!hasAdmin(interaction)) {
-        return interaction.reply({
-            content: "You need Administrator permission to use this command.",
-            ephemeral: true
-        });
-    }
-
-    const channel =
-        interaction.options.getChannel("channel");
-
-    if (
-        channel.type !== ChannelType.GuildText
-    ) {
-        return interaction.reply({
-            content: "Please select a text channel.",
-            ephemeral: true
-        });
-    }
-
-    welcomeChannels.set(
-        interaction.guild.id,
-        channel.id
-    );
-
-    await sendLog(
-        interaction.guild,
-        "Welcome Channel Updated",
-        `**Channel:** ${channel}\n` +
-        `**Changed by:** ${interaction.user.tag}`,
-        0x57F287
-    );
-
-    return interaction.reply({
-        content:
-            `Welcome messages are now set to ${channel}.`,
-        ephemeral: true
-    });
-}
-
-            if (command === "ping") {
-
-                return interaction.reply({
-                    content: `Pong! **${client.ws.ping}ms**`,
-                    ephemeral: true
-                });
-            }
-
-            if (command === "botinfo") {
-
-                const embed = new EmbedBuilder()
-                    .setTitle(`${CONFIG.botName}`)
-                    .setDescription(
-                        "Advanced Discord moderation, ticket and application system."
-                    )
-                    .addFields(
-                        {
-                            name: "Servers",
-                            value: `${client.guilds.cache.size}`,
-                            inline: true
-                        },
-                        {
-                            name: "Commands",
-                            value: `${commands.length}`,
-                            inline: true
-                        },
-                        {
-                            name: "Ping",
-                            value: `${client.ws.ping}ms`,
-                            inline: true
-                        }
-                    )
-                    .setColor(0x5865F2);
-
-                return interaction.reply({
-                    embeds: [embed]
-                });
-            }
-
-            if (command === "serverinfo") {
-
-                const guild = interaction.guild;
-
-                const embed = new EmbedBuilder()
-                    .setTitle(guild.name)
-                    .addFields(
-                        {
-                            name: "Members",
-                            value: `${guild.memberCount}`,
-                            inline: true
-                        },
-                        {
-                            name: "Channels",
-                            value: `${guild.channels.cache.size}`,
-                            inline: true
-                        },
-                        {
-                            name: "Roles",
-                            value: `${guild.roles.cache.size}`,
-                            inline: true
-                        }
-                    )
-                    .setColor(0x5865F2);
-
-                return interaction.reply({
-                    embeds: [embed]
-                });
-            }
-
-            if (command === "userinfo") {
-
-                const user =
-                    interaction.options.getUser("user") ||
-                    interaction.user;
-
-                const member =
-                    await interaction.guild.members
-                        .fetch(user.id)
-                        .catch(() => null);
-
-                const embed = new EmbedBuilder()
-                    .setTitle(user.tag)
-                    .setThumbnail(user.displayAvatarURL())
-                    .addFields(
-                        {
-                            name: "User ID",
-                            value: user.id
-                        },
-                        {
-                            name: "Joined Server",
-                            value: member
-                                ? `<t:${Math.floor(member.joinedTimestamp / 1000)}:F>`
-                                : "Unknown"
-                        },
-                        {
-                            name: "Account Created",
-                            value: `<t:${Math.floor(user.createdTimestamp / 1000)}:F>`
-                        }
-                    )
-                    .setColor(0x5865F2);
-
-                return interaction.reply({
-                    embeds: [embed]
-                });
-            }
-
-            if (command === "avatar") {
-
-                const user =
-                    interaction.options.getUser("user") ||
-                    interaction.user;
-
-                return interaction.reply({
-                    content: user.displayAvatarURL({
-                        size: 4096,
-                        extension: "png"
-                    })
-                });
-            }
-
-            if (command === "help") {
-
-                const embed = new EmbedBuilder()
-                    .setTitle(`${CONFIG.botName} Commands`)
-                    .setDescription(
-                        [
-                            "**General**",
-                            "`/ping` `/botinfo` `/serverinfo` `/userinfo` `/avatar` `/help`",
-                            "",
-                            "**Moderation**",
-                            "`/kick` `/ban` `/unban` `/timeout` `/warn` `/clear`",
-                            "",
-                            "**Tickets**",
-                            "`/ticketpanel` `/ticket` `/ticketclaim` `/ticketclose` `/ticketdelete`",
-                            "",
-                            "**Applications**",
-                            "`/apply` `/applicationpanel` `/applications`",
-                            "",
-                            "**Setup**",
-                            "`/setup` `/setlogs` `/setuptickets` `/setupapplications`"
-                        ].join("\n")
-                    )
-                    .setColor(0x5865F2);
-
-                return interaction.reply({
-                    embeds: [embed]
-                });
-            }
-
-            /* =========================
-               PERMISSION CHECK
-            ========================= */
-
-            if (
-                [
-                    "kick",
-                    "ban",
-                    "unban",
-                    "timeout",
-                    "warn",
-                    "clear"
-                ].includes(command)
-            ) {
-                if (!hasModeration(interaction)) {
-                    return interaction.reply({
-                        content: "You do not have permission to use this command.",
-                        ephemeral: true
-                    });
-                }
-            }
-
-            /* =========================
-               KICK
-            ========================= */
-
-            if (command === "kick") {
-
-                const user = interaction.options.getUser("user");
-                const reason =
-                    interaction.options.getString("reason") ||
-                    "No reason provided.";
-
-                const member =
-                    await interaction.guild.members
-                        .fetch(user.id)
-                        .catch(() => null);
-
-                if (!member) {
-                    return interaction.reply({
-                        content: "That member is not in the server.",
-                        ephemeral: true
-                    });
-                }
-
-                if (!member.kickable) {
-                    return interaction.reply({
-                        content: "I cannot kick that member.",
-                        ephemeral: true
-                    });
-                }
-
-                await member.kick(reason);
-
-                await sendLog(
-                    interaction.guild,
-                    "Member Kicked",
-                    `**User:** ${user.tag}\n**Moderator:** ${interaction.user.tag}\n**Reason:** ${reason}`,
-                    0xED4245
-                );
-
-                return interaction.reply({
-                    content: `Kicked **${user.tag}**.`
-                });
-            }
-
-            /* =========================
-               BAN
-            ========================= */
-
-            if (command === "ban") {
-
-                const user = interaction.options.getUser("user");
-                const reason =
-                    interaction.options.getString("reason") ||
-                    "No reason provided.";
-
-                const member =
-                    await interaction.guild.members
-                        .fetch(user.id)
-                        .catch(() => null);
-
-                if (member && !member.bannable) {
-                    return interaction.reply({
-                        content: "I cannot ban that member.",
-                        ephemeral: true
-                    });
-                }
-
-                await interaction.guild.members.ban(user.id, {
-                    reason
-                });
-
-                await sendLog(
-                    interaction.guild,
-                    "Member Banned",
-                    `**User:** ${user.tag}\n**Moderator:** ${interaction.user.tag}\n**Reason:** ${reason}`,
-                    0xED4245
-                );
-
-                return interaction.reply({
-                    content: `Banned **${user.tag}**.`
-                });
-            }
-
-            /* =========================
-               UNBAN
-            ========================= */
-
-            if (command === "unban") {
-
-                const userId =
-                    interaction.options.getString("userid");
-
-                try {
-
-                    await interaction.guild.members.unban(userId);
-
-                    await sendLog(
-                        interaction.guild,
-                        "Member Unbanned",
-                        `**User ID:** ${userId}\n**Moderator:** ${interaction.user.tag}`,
-                        0x57F287
-                    );
-
-                    return interaction.reply({
-                        content: `Unbanned **${userId}**.`
-                    });
-
-                } catch {
-                    return interaction.reply({
-                        content: "That user is not banned or the ID is invalid.",
-                        ephemeral: true
-                    });
-                }
-            }
-
-            /* =========================
-               TIMEOUT
-            ========================= */
-
-            if (command === "timeout") {
-
-                const user =
-                    interaction.options.getUser("user");
-
-                const minutes =
-                    interaction.options.getInteger("minutes");
-
-                const reason =
-                    interaction.options.getString("reason") ||
-                    "No reason provided.";
-
-                const member =
-                    await interaction.guild.members
-                        .fetch(user.id)
-                        .catch(() => null);
-
-                if (!member) {
-                    return interaction.reply({
-                        content: "Member not found.",
-                        ephemeral: true
-                    });
-                }
-
-                if (!member.moderatable) {
-                    return interaction.reply({
-                        content: "I cannot timeout that member.",
-                        ephemeral: true
-                    });
-                }
-
-                await member.timeout(
-                    minutes * 60 * 1000,
-                    reason
-                );
-
-                await sendLog(
-                    interaction.guild,
-                    "Member Timed Out",
-                    `**User:** ${user.tag}\n**Duration:** ${minutes} minutes\n**Moderator:** ${interaction.user.tag}\n**Reason:** ${reason}`,
-                    0xFEE75C
-                );
-
-                return interaction.reply({
-                    content: `Timed out **${user.tag}** for ${minutes} minutes.`
-                });
-            }
-
-            /* =========================
-               WARN
-            ========================= */
-
-            if (command === "warn") {
-
-                const user =
-                    interaction.options.getUser("user");
-
-                const reason =
-                    interaction.options.getString("reason");
-
-                await sendLog(
-                    interaction.guild,
-                    "Member Warned",
-                    `**User:** ${user.tag}\n**Moderator:** ${interaction.user.tag}\n**Reason:** ${reason}`,
-                    0xFEE75C
-                );
-
-                return interaction.reply({
-                    content: `Warned **${user.tag}**.\nReason: ${reason}`
-                });
-            }
-
-            /* =========================
-               CLEAR
-            ========================= */
-
-            if (command === "clear") {
-
-                const amount =
-                    interaction.options.getInteger("amount");
-
-                const deleted =
-                    await interaction.channel.bulkDelete(
-                        amount,
-                        true
-                    );
-
-                return interaction.reply({
-                    content: `Deleted **${deleted.size}** messages.`,
-                    ephemeral: true
-                });
-            }
-
-            /* =========================
-               OWNER CHECK
-            ========================= */
-
-            if (
-                [
-                    "ticketpanel",
-                    "applicationpanel",
-                    "setup",
-                    "setlogs",
-                    "setuptickets",
-                    "setupapplications"
-                ].includes(command)
-            ) {
-
-                if (!hasAdmin(interaction)) {
-                    return interaction.reply({
-                        content: "You do not have permission to use this command.",
-                        ephemeral: true
-                    });
-                }
-            }
-
-            /* =========================
-               SET LOGS
-            ========================= */
-
-            if (command === "setlogs") {
-
-                const channel =
-                    await getOrCreateLogChannel(
-                        interaction.guild
-                    );
-
-                return interaction.reply({
-                    content: `Logging channel is ${channel}.`,
-                    ephemeral: true
-                });
-            }
-
-            /* =========================
-               SETUP
-            ========================= */
-
-            if (command === "setup") {
-
-                await getOrCreateRole(
-                    interaction.guild,
-                    CONFIG.supportRoleName,
-                    0x5865F2
-                );
-
-                await getOrCreateRole(
-                    interaction.guild,
-                    CONFIG.adminRoleName,
-                    0xED4245
-                );
-
-                await getOrCreateRole(
-                    interaction.guild,
-                    CONFIG.moderatorRoleName,
-                    0xFEE75C
-                );
-
-                await getOrCreateCategory(
-                    interaction.guild,
-                    CONFIG.ticketCategoryName
-                );
-
-                await getOrCreateCategory(
-                    interaction.guild,
-                    CONFIG.applicationCategoryName
-                );
-
-                await getOrCreateLogChannel(
-                    interaction.guild
-                );
-
-                await sendLog(
-                    interaction.guild,
-                    "Bot Setup Completed",
-                    `Setup completed by **${interaction.user.tag}**.`,
-                    0x57F287
-                );
-
-                return interaction.reply({
-                    content:
-                        "Full basic setup completed.\n\n" +
-                        "Created/verified:\n" +
-                        "• Support Team role\n" +
-                        "• Admin role\n" +
-                        "• Moderator role\n" +
-                        "• Tickets category\n" +
-                        "• Applications category\n" +
-                        "• Logging channel",
-                    ephemeral: true
-                });
-            }
-
-            /* =========================
-               SETUP TICKETS
-            ========================= */
-
-            if (command === "setuptickets") {
-
-                await getOrCreateRole(
-                    interaction.guild,
-                    CONFIG.supportRoleName,
-                    0x5865F2
-                );
-
-                await getOrCreateCategory(
-                    interaction.guild,
-                    CONFIG.ticketCategoryName
-                );
-
-                return interaction.reply({
-                    content: "Ticket system setup completed.",
-                    ephemeral: true
-                });
-            }
-
-            /* =========================
-               SETUP APPLICATIONS
-            ========================= */
-
-            if (command === "setupapplications") {
-
-                await getOrCreateCategory(
-                    interaction.guild,
-                    CONFIG.applicationCategoryName
-                );
-
-                return interaction.reply({
-                    content:
-                        "Application system setup completed.",
-                    ephemeral: true
-                });
-            }
-
-            /* =========================
-               TICKET PANEL
-            ========================= */
-
-            if (command === "ticketpanel") {
-
-                const embed = new EmbedBuilder()
-                    .setTitle("Support Tickets")
-                    .setDescription(
-                        "Need help? Open a ticket below.\n\n" +
-                        "A support member will be notified when your ticket is created."
-                    )
-                    .setColor(0x5865F2);
-
-                const row = new ActionRowBuilder()
-                    .addComponents(
-                        new ButtonBuilder()
-                            .setCustomId("create_ticket")
-                            .setLabel("Open Ticket")
-                            .setEmoji("🎫")
-                            .setStyle(ButtonStyle.Primary)
-                    );
-
-                await interaction.channel.send({
-                    embeds: [embed],
-                    components: [row]
-                });
-
-                return interaction.reply({
-                    content: "Ticket panel created.",
-                    ephemeral: true
-                });
-            }
-
-            /* =========================
-               TICKET COMMAND
-            ========================= */
-
-            if (command === "ticket") {
-
-                return createTicket(interaction);
-            }
-
-            /* =========================
-               TICKET CLAIM
-            ========================= */
-
-            if (command === "ticketclaim") {
-
-                return claimTicket(interaction);
-            }
-
-            /* =========================
-               TICKET CLOSE
-            ========================= */
-
-            if (command === "ticketclose") {
-
-                return closeTicket(interaction);
-            }
-
-            /* =========================
-               TICKET DELETE
-            ========================= */
-
-            if (command === "ticketdelete") {
-
-                return deleteTicket(interaction);
-            }
-
-            /* =========================
-               APPLICATION PANEL
-            ========================= */
-
-            if (command === "applicationpanel") {
-
-                const embed = new EmbedBuilder()
-                    .setTitle("Staff Applications")
-                    .setDescription(
-                        "Choose the staff position you want to apply for."
-                    )
-                    .setColor(0x5865F2);
-
-                const menu =
-                    new StringSelectMenuBuilder()
-                        .setCustomId("application_role")
-                        .setPlaceholder("Choose a position")
-                        .addOptions(
-                            new StringSelectMenuOptionBuilder()
-                                .setLabel("Tester")
-                                .setDescription("Apply for Tester")
-                                .setValue("tester")
-                                .setEmoji("🧪"),
-
-                            new StringSelectMenuOptionBuilder()
-                                .setLabel("Moderator")
-                                .setDescription("Apply for Moderator")
-                                .setValue("moderator")
-                                .setEmoji("🛡️"),
-
-                            new StringSelectMenuOptionBuilder()
-                                .setLabel("Support")
-                                .setDescription("Apply for Support")
-                                .setValue("support")
-                                .setEmoji("🎧"),
-
-                            new StringSelectMenuOptionBuilder()
-                                .setLabel("Developer")
-                                .setDescription("Apply for Developer")
-                                .setValue("developer")
-                                .setEmoji("💻")
-                        );
-
-                const row =
-                    new ActionRowBuilder()
-                        .addComponents(menu);
-
-                await interaction.channel.send({
-                    embeds: [embed],
-                    components: [row]
-                });
-
-                return interaction.reply({
-                    content: "Application panel created.",
-                    ephemeral: true
-                });
-            }
-
-            /* =========================
-               APPLY
-            ========================= */
-
-            if (command === "apply") {
-
-                return interaction.reply({
-                    content:
-                        "Use the application panel to select the position you want to apply for.",
-                    ephemeral: true
-                });
-            }
-
-            /* =========================
-               APPLICATION INFO
-            ========================= */
-
-            if (command === "applications") {
-
-                return interaction.reply({
-                    content:
-                        "**Available positions:**\n" +
-                        "🧪 Tester\n" +
-                        "🛡️ Moderator\n" +
-                        "🎧 Support\n" +
-                        "💻 Developer\n\n" +
-                        "Each application contains 10 questions and every answer receives a 1–10 score.",
-                    ephemeral: true
-                });
-            }
-        }
-
-        /* =================================================
-           BUTTONS
-        ================================================= */
-
-       if (interaction.isButton()) {
-
-    if (interaction.replied || interaction.deferred) {
-        return;
-    }
-
-            if (interaction.customId === "create_ticket") {
-                return createTicket(interaction);
-            }
-
-            if (interaction.customId === "claim_ticket") {
-                return claimTicket(interaction);
-            }
-
-            if (interaction.customId === "close_ticket") {
-                return closeTicket(interaction);
-            }
-
-            if (interaction.customId === "delete_ticket") {
-                return deleteTicket(interaction);
-            }
-
-            if (interaction.customId === "start_application") {
-
-                return startApplication(
-                    interaction,
-                    interaction.customId.split("_")[2]
-                );
-            }
-        }
-
-        /* =================================================
-           APPLICATION SELECT MENU
-        ================================================= */
-
-        if (
-            interaction.isStringSelectMenu() &&
-            interaction.customId === "application_role"
-        ) {
-
-            const role = interaction.values[0];
-
-            return startApplication(
-                interaction,
-                role
-            );
-        }
-
-        /* =================================================
-           APPLICATION MODAL
-        ================================================= */
-
-        if (
-    interaction.isModalSubmit() &&
-    (
-        interaction.customId.startsWith("application_") ||
-        interaction.customId.startsWith("application2_")
-    )
-) {
-
-            return submitApplication(interaction);
-        }
-
-    } catch (error) {
-
-        console.error("Interaction error:", error);
-
-        if (interaction.replied || interaction.deferred) {
-
-            await interaction.followUp({
-                content:
-                    "An unexpected error occurred.",
-                ephemeral: true
-            }).catch(() => {});
-
-        } else {
-
-            await interaction.reply({
-                content:
-                    "An unexpected error occurred.",
-                ephemeral: true
-            }).catch(() => {});
-        }
-    }
-});
-
-/* =========================================================
-   CREATE TICKET
-========================================================= */
-
-async function createTicket(interaction) {
-
-    const guild = interaction.guild;
-    const user = interaction.user;
-
-    const existing = guild.channels.cache.find(
-        channel =>
-            channel.name ===
-            `ticket-${safeChannelName(user.username)}`
-    );
-
-    if (existing) {
-
-        return interaction.reply({
-            content: `You already have a ticket: ${existing}`,
-            ephemeral: true
-        });
-    }
-
-    const category =
-        await getOrCreateCategory(
-            guild,
-            CONFIG.ticketCategoryName
-        );
-
-    const supportRole =
-        await getOrCreateRole(
-            guild,
-            CONFIG.supportRoleName
-        );
-
-    const channel =
-        await guild.channels.create({
-            name: `ticket-${safeChannelName(user.username)}`,
-            type: ChannelType.GuildText,
-            parent: category.id,
-
-            permissionOverwrites: [
-                {
-                    id: guild.roles.everyone.id,
-                    deny: [
-                        PermissionsBitField.Flags.ViewChannel
-                    ]
-                },
-
-                {
-                    id: user.id,
-                    allow: [
-                        PermissionsBitField.Flags.ViewChannel,
-                        PermissionsBitField.Flags.SendMessages,
-                        PermissionsBitField.Flags.ReadMessageHistory
-                    ]
-                },
-
-                {
-                    id: supportRole.id,
-                    allow: [
-                        PermissionsBitField.Flags.ViewChannel,
-                        PermissionsBitField.Flags.SendMessages,
-                        PermissionsBitField.Flags.ReadMessageHistory,
-                        PermissionsBitField.Flags.ManageMessages
-                    ]
-                }
-            ]
-        });
-
-    const embed = new EmbedBuilder()
-        .setTitle("Support Ticket")
-        .setDescription(
-            `Welcome ${user}.\n\n` +
-            "Please explain what you need help with.\n" +
-            "A support member will be with you shortly."
-        )
-        .setColor(0x5865F2)
-        .setFooter({
-            text: "LegacyUnlock Ticket System"
-        });
-
-    const row =
-        new ActionRowBuilder()
-            .addComponents(
-                new ButtonBuilder()
-                    .setCustomId("claim_ticket")
-                    .setLabel("Claim")
-                    .setEmoji("🙋")
-                    .setStyle(ButtonStyle.Success),
-
-                new ButtonBuilder()
-                    .setCustomId("close_ticket")
-                    .setLabel("Close")
-                    .setEmoji("🔒")
-                    .setStyle(ButtonStyle.Secondary),
-
-                new ButtonBuilder()
-                    .setCustomId("delete_ticket")
-                    .setLabel("Delete")
-                    .setEmoji("🗑️")
-                    .setStyle(ButtonStyle.Danger)
-            );
-
-    await channel.send({
-        content: `${user} <@&${supportRole.id}>`,
-        embeds: [embed],
-        components: [row]
-    });
-
-    await sendLog(
-        guild,
-        "Ticket Created",
-        `**User:** ${user.tag}\n**Channel:** ${channel}`,
-        0x57F287
-    );
-
-    return interaction.reply({
-        content: `Your ticket has been created: ${channel}`,
-        ephemeral: true
-    });
-}
-
-/* =========================================================
-   CLAIM TICKET
-========================================================= */
-
-async function claimTicket(interaction) {
-
-    if (!interaction.channel.name.startsWith("ticket-")) {
-
-        return interaction.reply({
-            content: "This is not a ticket channel.",
-            ephemeral: true
-        });
-    }
-
-    const supportRole =
-        interaction.guild.roles.cache.find(
-            role =>
-                role.name.toLowerCase() ===
-                CONFIG.supportRoleName.toLowerCase()
-        );
-
-    if (
-        !isOwner(interaction) &&
-        !interaction.member.permissions.has(
-            PermissionsBitField.Flags.ManageChannels
-        ) &&
-        (!supportRole ||
-            !interaction.member.roles.cache.has(supportRole.id))
-    ) {
-
-        return interaction.reply({
-            content: "Only the support team can claim tickets.",
-            ephemeral: true
-        });
-    }
-
-    await interaction.channel.setTopic(
-        `Claimed by ${interaction.user.tag}`
-    );
-
-    await sendLog(
-        interaction.guild,
-        "Ticket Claimed",
-        `**Ticket:** ${interaction.channel}\n**Claimed by:** ${interaction.user.tag}`,
-        0x57F287
-    );
-
-    return interaction.reply({
-        content: `This ticket has been claimed by ${interaction.user}.`
-    });
-}
-
-/* =========================================================
-   CLOSE TICKET
-========================================================= */
-
-async function closeTicket(interaction) {
-
-    if (!interaction.channel.name.startsWith("ticket-")) {
-
-        return interaction.reply({
-            content: "This is not a ticket channel.",
-            ephemeral: true
-        });
-    }
-
-    if (
-        !hasAdmin(interaction) &&
-        !interaction.member.permissions.has(
-            PermissionsBitField.Flags.ManageChannels
-        )
-    ) {
-
-        const supportRole =
-            interaction.guild.roles.cache.find(
-                role =>
-                    role.name.toLowerCase() ===
-                    CONFIG.supportRoleName.toLowerCase()
-            );
-
-        if (
-            !supportRole ||
-            !interaction.member.roles.cache.has(
-                supportRole.id
-            )
-        ) {
-
-            return interaction.reply({
-                content: "You cannot close this ticket.",
-                ephemeral: true
-            });
-        }
-    }
-
-    await interaction.channel.permissionOverwrites.edit(
-        interaction.guild.roles.everyone,
-        {
-            ViewChannel: false
-        }
-    );
-
-    await interaction.channel.setName(
-        `closed-${interaction.channel.name.replace(
-            "ticket-",
-            ""
-        )}`
-    );
-
-    await sendLog(
-        interaction.guild,
-        "Ticket Closed",
-        `**Channel:** ${interaction.channel}\n**Closed by:** ${interaction.user.tag}`,
-        0xFEE75C
-    );
-
-    return interaction.reply({
-        content: "Ticket closed."
-    });
-}
-
-/* =========================================================
-   DELETE TICKET
-========================================================= */
-
-async function deleteTicket(interaction) {
-
-    if (!interaction.channel.name.includes("ticket") &&
-        !interaction.channel.name.includes("closed-")) {
-
-        return interaction.reply({
-            content: "This does not appear to be a ticket channel.",
-            ephemeral: true
-        });
-    }
-
-    if (
-        !hasAdmin(interaction) &&
-        !interaction.member.permissions.has(
-            PermissionsBitField.Flags.ManageChannels
-        )
-    ) {
-
-        return interaction.reply({
-            content: "You need Manage Channels or Administrator to delete tickets.",
-            ephemeral: true
-        });
-    }
-
-    const channelName = interaction.channel.name;
-
-    await sendLog(
-        interaction.guild,
-        "Ticket Deleted",
-        `**Channel:** ${channelName}\n**Deleted by:** ${interaction.user.tag}`,
-        0xED4245
-    );
-
-    await interaction.reply({
-        content: "Deleting ticket..."
-    });
-
-    setTimeout(() => {
-        interaction.channel.delete().catch(() => {});
-    }, 1500);
-}
-
-/* =========================================================
-   START APPLICATION
-========================================================= */
-
-async function startApplication(interaction, role) {
-
-    if (!ROLE_TESTS[role]) {
-
-        return interaction.reply({
-            content: "That application type does not exist.",
-            ephemeral: true
-        });
-    }
-
-    const questions = ROLE_TESTS[role];
-
-    const modal =
-        new ModalBuilder()
-            .setCustomId(
-                `application_${role}_${interaction.user.id}`
-            )
-            .setTitle(
-                `${role.charAt(0).toUpperCase() + role.slice(1)} Application`
-            );
-
-    /*
-       Discord modals have a maximum of 5 text inputs.
-       Therefore Part 1 asks questions 1-5.
-       Part 2 will handle the remaining questions.
-    */
-
-    for (let i = 0; i < 5; i++) {
-
-        const input =
-            new TextInputBuilder()
-                .setCustomId(`q${i + 1}`)
-                .setLabel(
-                    `${i + 1}. ${questions[i].slice(0, 45)}`
-                )
-                .setStyle(TextInputStyle.Paragraph)
-                .setRequired(true)
-                .setMaxLength(1000);
-
-        modal.addComponents(
-            new ActionRowBuilder().addComponents(input)
-        );
-    }
-
-    applications.set(interaction.user.id, {
-        role,
-        questions,
-        answers: [],
-        currentPage: 1
-    });
-
-    return interaction.showModal(modal);
-}
-
-/* =========================================================
-   APPLICATION SUBMISSION
-========================================================= */
-
-async function submitApplication(interaction) {
-
-    const parts =
-        interaction.customId.split("_");
-
-    const role = parts[1];
-
-    const userId = parts[2];
-
-    const application =
-        applications.get(userId);
-
-    if (!application) {
-
-        return interaction.reply({
-            content:
-                "Your application session expired. Please start again.",
-            ephemeral: true
-        });
-    }
-
-    const answers = [];
-
-    for (let i = 1; i <= 5; i++) {
-
-        const answer =
-            interaction.fields.getTextInputValue(
-                `q${i}`
-            );
-
-        answers.push(answer);
-    }
-
-    application.answers.push(...answers);
-
-    /*
-       If questions 6-10 remain, show the second modal.
-    */
-
-    if (application.answers.length < 10) {
-
-        const modal =
-            new ModalBuilder()
-                .setCustomId(
-                    `application2_${role}_${userId}`
-                )
-                .setTitle(
-                    `${role.charAt(0).toUpperCase() + role.slice(1)} Application 2/2`
-                );
-
-        for (let i = 5; i < 10; i++) {
-
-            const input =
-                new TextInputBuilder()
-                    .setCustomId(`q${i + 1}`)
-                    .setLabel(
-                        `${i + 1}. ${application.questions[i].slice(0, 45)}`
-                    )
-                    .setStyle(TextInputStyle.Paragraph)
-                    .setRequired(true)
-                    .setMaxLength(1000);
-
-            modal.addComponents(
-                new ActionRowBuilder().addComponents(input)
-            );
-        }
-
-        application.currentPage = 2;
-
-        return interaction.showModal(modal);
-    }
-
-    /*
-       Rate all 10 answers.
-    */
-
-    const scores =
-        application.answers.map(rateAnswer);
-
-    const total =
-        scores.reduce(
-            (sum, score) => sum + score,
-            0
-        );
-
-    const average =
-        Math.round(
-            (total / scores.length) * 100
-        ) / 100;
-
-    const passed =
-        average >= CONFIG.minimumPassingScore;
-
-    /*
-       Create application channel.
-    */
-
-    const category =
-        await getOrCreateCategory(
-            interaction.guild,
-            CONFIG.applicationCategoryName
-        );
-
-    const supportRole =
-        await getOrCreateRole(
-            interaction.guild,
-            CONFIG.supportRoleName
-        );
-
-    const channel =
-        await interaction.guild.channels.create({
-            name:
-                `application-${safeChannelName(interaction.user.username)}`,
-            type: ChannelType.GuildText,
-            parent: category.id,
-
-            permissionOverwrites: [
-                {
-                    id:
-                        interaction.guild.roles.everyone.id,
-                    deny: [
-                        PermissionsBitField.Flags.ViewChannel
-                    ]
-                },
-
-                {
-                    id: interaction.user.id,
-                    allow: [
-                        PermissionsBitField.Flags.ViewChannel,
-                        PermissionsBitField.Flags.ReadMessageHistory
-                    ]
-                },
-
-                {
-                    id: supportRole.id,
-                    allow: [
-                        PermissionsBitField.Flags.ViewChannel,
-                        PermissionsBitField.Flags.SendMessages,
-                        PermissionsBitField.Flags.ReadMessageHistory,
-                        PermissionsBitField.Flags.ManageMessages
-                    ]
-                }
-            ]
-        });
-
-    const resultEmbed =
-        new EmbedBuilder()
-            .setTitle("Staff Application")
-            .setDescription(
-                `**Applicant:** ${interaction.user}\n` +
-                `**Position:** ${role}\n` +
-                `**Final Score:** ${average}/10\n` +
-                `**Result:** ${passed ? "PASSED" : "FAILED"}`
-            )
-            .setColor(
-                passed ? 0x57F287 : 0xED4245
-            )
-            .setTimestamp();
-
-    await channel.send({
-        content:
-            `${interaction.user} <@&${supportRole.id}>`,
-        embeds: [resultEmbed]
-    });
-
-    for (let i = 0; i < 10; i++) {
-
-        const questionEmbed =
-            new EmbedBuilder()
-                .setTitle(
-                    `Question ${i + 1}`
-                )
-                .setDescription(
-                    `**Question:**\n${application.questions[i]}\n\n` +
-                    `**Answer:**\n${application.answers[i]}\n\n` +
-                    `**AI Score:** ${scores[i]}/10`
-                )
-                .setColor(0x5865F2);
-
-        await channel.send({
-            embeds: [questionEmbed]
-        });
-    }
-
-    await sendLog(
-        interaction.guild,
-        "Application Submitted",
-        `**Applicant:** ${interaction.user.tag}\n` +
-        `**Position:** ${role}\n` +
-        `**Score:** ${average}/10\n` +
-        `**Result:** ${passed ? "PASSED" : "FAILED"}\n` +
-        `**Application:** ${channel}`,
-        passed ? 0x57F287 : 0xED4245
-    );
-
-    applications.delete(userId);
-
-    return interaction.reply({
-        content:
-            `Your **${role}** application has been submitted.\n` +
-            `Final score: **${average}/10**\n` +
-            `Result: **${passed ? "PASSED" : "FAILED"}**\n\n` +
-            `Your application has been sent to the support team.`,
-        ephemeral: true
-    });
-}
-
-/* =========================================================
-   MESSAGE LOGGING
-========================================================= */
-
-client.on("messageDelete", async message => {
-
-    if (!message.guild || message.author?.bot) {
-        return;
-    }
-
-    await sendLog(
-        message.guild,
-        "Message Deleted",
-        `**Author:** ${message.author?.tag || "Unknown"}\n` +
-        `**Channel:** ${message.channel}\n` +
-        `**Content:** ${message.content?.slice(0, 1000) || "Unavailable"}`,
-        0xED4245
-    );
-});
-
-client.on("messageUpdate", async (oldMessage, newMessage) => {
-
-    if (
-        !oldMessage.guild ||
-        oldMessage.author?.bot ||
-        oldMessage.content === newMessage.content
-    ) {
-        return;
-    }
-
-    await sendLog(
-        oldMessage.guild,
-        "Message Edited",
-        `**Author:** ${oldMessage.author?.tag || "Unknown"}\n` +
-        `**Channel:** ${oldMessage.channel}\n\n` +
-        `**Before:** ${oldMessage.content?.slice(0, 500) || "Unavailable"}\n` +
-        `**After:** ${newMessage.content?.slice(0, 500) || "Unavailable"}`,
-        0xFEE75C
-    );
-});
-
-/* =========================================================
-   MEMBER LOGGING
-========================================================= */
-
-client.on("guildMemberAdd", async member => {
-
-    await sendLog(
-        member.guild,
-        "Member Joined",
-        `**User:** ${member.user.tag}\n**ID:** ${member.id}`,
-        0x57F287
-    );
-});
-
-client.on("guildMemberRemove", async member => {
-
-    await sendLog(
-        member.guild,
-        "Member Left",
-        `**User:** ${member.user.tag}\n**ID:** ${member.id}`,
-        0xED4245
-    );
-});
-
-/* =========================================================
-   ERROR HANDLERS
-========================================================= */
-
-process.on("unhandledRejection", error => {
-    console.error("Unhandled rejection:", error);
-});
-
-process.on("uncaughtException", error => {
-    console.error("Uncaught exception:", error);
-});
-
-/* =========================================================
-   LOGIN
-========================================================= */
-
-client.login(TOKEN);
-
-/* =========================================================
-   PART 3 + 4
-   SECURITY / ANTI-RAID / ANTI-SPAM / ANTI-LINK / ANTI-SLUR
-   EXTRA MODERATION / CONFIG / SECURITY LOGGING
-========================================================= */
-
-/* =========================================================
-   SECURITY CONFIG
-========================================================= */
-
-const SECURITY = {
-    antiSpam: true,
-    antiLinks: true,
-    antiSlurs: true,
-    antiRaid: true,
-    antiNuke: true,
-
-    spamMessageLimit: 6,
-    spamTimeWindow: 5000,
-
-    raidJoinLimit: 8,
-    raidTimeWindow: 10000,
-
-    punishment: "timeout",
-
-    timeoutMinutes: 10,
-
-    deleteBadMessages: true,
-
-    logSecurityEvents: true
-};
-
-/* =========================================================
-   RUNTIME SECURITY STORAGE
-========================================================= */
-
-const welcomeChannels = new Map();
-
-const spamTracker = new Map();
-
-const joinTracker = new Map();
-
-const warningTracker = new Map();
-
-const securityActions = new Collection();
-
-/* =========================================================
-   SLUR FILTER
-   Keep this intentionally configurable.
-========================================================= */
-
-const BLOCKED_WORDS = [
-    "nigger",
-    "nigga",
-    "faggot",
-    "fag",
-    "retard",
-    "tranny",
-    "dyke",
-    "nka",
-    "nca",
-    "ncr",
-
-
-
-];
-
-/* =========================================================
-   LINK FILTER
-========================================================= */
-
-const LINK_REGEX =
-    /(https?:\/\/|www\.|discord\.gg\/|discord\.com\/invite\/)/i;
-
-/* =========================================================
-   SECURITY HELPERS
-========================================================= */
-
-function isSecurityAdmin(member) {
-
-    if (!member) return false;
-
-    return (
-        member.id === OWNER_ID ||
-        member.permissions.has(
-            PermissionsBitField.Flags.Administrator
-        )
-    );
-}
-
-function containsBlockedWord(content) {
-
-    const lower =
-        content
-            .toLowerCase()
-            .replace(/[^\p{L}\p{N}\s]/gu, " ");
-
-    return BLOCKED_WORDS.some(word => {
-
-        const regex =
-            new RegExp(`(^|\\s)${word}(?=\\s|$)`, "i");
-
-        return regex.test(lower);
-    });
-}
-
-function containsLink(content) {
-    return LINK_REGEX.test(content);
-}
-
-function addSecurityAction(guildId, userId) {
-
-    const key =
-        `${guildId}:${userId}`;
-
-    const now = Date.now();
-
-    const existing =
-        securityActions.get(key) || [];
-
-    existing.push(now);
-
-    const filtered =
-        existing.filter(
-            timestamp =>
-                now - timestamp < 60000
-        );
-
-    securityActions.set(
-        key,
-        filtered
-    );
-}
-
-async function punishSecurityUser(
-    member,
-    reason
-) {
-
-    if (!member) return;
-
-    if (
-        member.id === OWNER_ID ||
-        member.permissions.has(
-            PermissionsBitField.Flags.Administrator
-        )
-    ) {
-        return;
-    }
-
-    try {
-
-        if (
-            SECURITY.punishment === "timeout" &&
-            member.moderatable
-        ) {
-
-            await member.timeout(
-                SECURITY.timeoutMinutes * 60 * 1000,
-                reason
-            );
-
-            return;
-        }
-
-        if (
-            SECURITY.punishment === "kick" &&
-            member.kickable
-        ) {
-
-            await member.kick(reason);
-
-            return;
-        }
-
-    } catch (error) {
-
-        console.error(
-            "Security punishment error:",
-            error
-        );
-    }
-}
-
-/* =========================================================
-   SECURITY LOG
-========================================================= */
-
-async function securityLog(
-    guild,
-    title,
-    description,
-    color = 0xED4245
-) {
-
-    if (!SECURITY.logSecurityEvents) {
-        return;
-    }
-
-    await sendLog(
-        guild,
-        `Security | ${title}`,
-        description,
-        color
-    );
-}
-
-/* =========================================================
-   ANTI-SPAM
-========================================================= */
-
-client.on("messageCreate", async message => {
-
-    if (!message.guild) return;
-
-    if (message.author.bot) return;
-
-    if (!SECURITY.antiSpam) return;
-
-    const key =
-        `${message.guild.id}:${message.author.id}`;
-
-    const now =
-        Date.now();
-
-    let messages =
-        spamTracker.get(key) || [];
-
-    messages.push(now);
-
-    messages =
-        messages.filter(
-            timestamp =>
-                now - timestamp <=
-                SECURITY.spamTimeWindow
-        );
-
-    spamTracker.set(
-        key,
-        messages
-    );
-
-    if (
-        messages.length >=
-        SECURITY.spamMessageLimit
-    ) {
-
-        spamTracker.delete(key);
-
-        try {
-
-            if (
-                SECURITY.deleteBadMessages &&
-                message.channel
-                    .permissionsFor(
-                        message.guild.members.me
-                    )
-                    ?.has(
-                        PermissionsBitField.Flags.ManageMessages
-                    )
-            ) {
-
-                await message.channel.bulkDelete(
-                    Math.min(
-                        messages.length,
-                        10
-                    ),
-                    true
-                );
-            }
-
-        } catch (error) {
-
-            console.error(
-                "Anti-spam delete error:",
-                error
-            );
-        }
-
-        const member =
-            message.member;
-
-        await punishSecurityUser(
-            member,
-            "Automatic anti-spam protection"
-        );
-
-        await securityLog(
-            message.guild,
-            "Spam Detected",
-            `**User:** ${message.author.tag}\n` +
-            `**Channel:** ${message.channel}\n` +
-            `**Action:** Automatic protection`,
-            0xED4245
-        );
-    }
-});
-
-client.on("guildMemberAdd", async member => {
-
-    /* =========================
-       WELCOME MESSAGE
-    ========================= */
-
-    const channelId =
-        welcomeChannels.get(member.guild.id);
-
-    if (channelId) {
-
-        const channel =
-            member.guild.channels.cache.get(
-                channelId
-            );
-
-        if (channel) {
-
-            const embed =
-                new EmbedBuilder()
-                    .setTitle("Welcome!")
-                    .setDescription(
-                        `Welcome ${member} to **${member.guild.name}**!\n\n` +
-                        `You are member **#${member.guild.memberCount}**.`
-                    )
-                    .setThumbnail(
-                        member.user.displayAvatarURL({
-                            size: 1024
-                        })
-                    )
-                    .setColor(0x5865F2)
-                    .setTimestamp()
-                    .setFooter({
-                        text: "LegacyUnlock"
-                    });
-
-            await channel.send({
-                content: `${member}`,
-                embeds: [embed]
-            });
-        }
-    }
-
-    /* =========================
-       JOIN LOG
-    ========================= */
-
-    await sendLog(
-        member.guild,
-        "Member Joined",
-        `**User:** ${member.user.tag}\n` +
-        `**ID:** ${member.id}`,
-        0x57F287
-    );
-
-    /* =========================
-       ANTI-RAID
-    ========================= */
-
-    if (!SECURITY.antiRaid) {
-        return;
-    }
-
-    const guildId =
-        member.guild.id;
-
-    const now =
-        Date.now();
-
-    let joins =
-        joinTracker.get(guildId) || [];
-
-    joins.push(now);
-
-    joins =
-        joins.filter(
-            timestamp =>
-                now - timestamp <=
-                SECURITY.raidTimeWindow
-        );
-
-    joinTracker.set(
-        guildId,
-        joins
-    );
-
-    if (
-        joins.length >=
-        SECURITY.raidJoinLimit
-    ) {
-
-        await securityLog(
-            member.guild,
-            "Possible Raid Detected",
-            `**Recent joins:** ${joins.length}\n` +
-            `**Time window:** ${SECURITY.raidTimeWindow / 1000}s\n` +
-            `Automatic raid protection has been activated.`,
-            0xED4245
-        );
-    }
-});
-
-/* =========================================================
-   ANTI-LINK
-========================================================= */
-
-client.on("messageCreate", async message => {
-
-    if (!message.guild) return;
-
-    if (message.author.bot) return;
-
-    if (!SECURITY.antiLinks) return;
-
-    /*
-       Allow administrators and owner to post links.
-    */
-
-    if (
-        message.author.id === OWNER_ID ||
-        message.member.permissions.has(
-            PermissionsBitField.Flags.ManageMessages
-        )
-    ) {
-        return;
-    }
-
-    if (!containsLink(message.content)) {
-        return;
-    }
-
-    try {
-
-        if (
-            SECURITY.deleteBadMessages &&
-            message.deletable
-        ) {
-
-            await message.delete();
-        }
-
-    } catch (error) {
-
-        console.error(
-            "Anti-link error:",
-            error
-        );
-    }
-
-    await securityLog(
-        message.guild,
-        "Blocked Link",
-        `**User:** ${message.author.tag}\n` +
-        `**Channel:** ${message.channel}\n` +
-        `**Action:** Message removed`,
-        0xFEE75C
-    );
-});
-
-/* =========================================================
-   ANTI-SLUR
-========================================================= */
-
-client.on("messageCreate", async message => {
-
-    if (!message.guild) return;
-
-    if (message.author.bot) return;
-
-    if (!SECURITY.antiSlurs) return;
-
-    if (
-        message.author.id === OWNER_ID ||
-        message.member.permissions.has(
-            PermissionsBitField.Flags.ManageMessages
-        )
-    ) {
-        return;
-    }
-
-    if (!containsBlockedWord(message.content)) {
-        return;
-    }
-
-    try {
-
-        if (
-            SECURITY.deleteBadMessages &&
-            message.deletable
-        ) {
-
-            await message.delete();
-        }
-
-    } catch (error) {
-
-        console.error(
-            "Anti-slur error:",
-            error
-        );
-    }
-
-    await punishSecurityUser(
-        message.member,
-        "Automatic anti-slur protection"
-    );
-
-    await securityLog(
-        message.guild,
-        "Blocked Slur",
-        `**User:** ${message.author.tag}\n` +
-        `**Channel:** ${message.channel}\n` +
-        `**Action:** Message removed and user punished`,
-        0xED4245
-    );
-});
-
-/* =========================================================
-   ANTI-RAID
-========================================================= */
-
-client.on("guildMemberAdd", async member => {
-
-    if (!SECURITY.antiRaid) return;
-
-    const guildId =
-        member.guild.id;
-
-    const now =
-        Date.now();
-
-    let joins =
-        joinTracker.get(guildId) || [];
-
-    joins.push(now);
-
-    joins =
-        joins.filter(
-            timestamp =>
-                now - timestamp <=
-                SECURITY.raidTimeWindow
-        );
-
-    joinTracker.set(
-        guildId,
-        joins
-    );
-
-    if (
-        joins.length >=
-        SECURITY.raidJoinLimit
-    ) {
-
-        await securityLog(
-            member.guild,
-            "Possible Raid Detected",
-            `**Recent joins:** ${joins.length}\n` +
-            `**Time window:** ${SECURITY.raidTimeWindow / 1000}s\n` +
-            `Automatic raid protection has been activated.`,
-            0xED4245
-        );
-
-        /*
-           Temporarily lock the guild's default channel
-           where possible.
-        */
-
-        try {
-
-            const channels =
-                member.guild.channels.cache.filter(
-                    channel =>
-                        channel.type ===
-                        ChannelType.GuildText
-                );
-
-            for (
-                const channel of channels.values()
-            ) {
-
-                const permissions =
-                    channel.permissionsFor(
-                        member.guild.roles.everyone
-                    );
-
-                if (
-                    permissions &&
-                    permissions.has(
-                        PermissionsBitField.Flags.ViewChannel
-                    )
-                ) {
-
-                    await channel.permissionOverwrites.edit(
-                        member.guild.roles.everyone,
-                        {
-                            SendMessages: false
-                        },
-                        {
-                            reason:
-                                "Automatic anti-raid protection"
-                        }
-                    );
-                }
-            }
-
-        } catch (error) {
-
-            console.error(
-                "Raid lock error:",
-                error
-            );
-        }
-
-        /*
-           Reset after 60 seconds.
-        */
-
-        setTimeout(
-            async () => {
-
-                try {
-
-                    const channels =
-                        member.guild.channels.cache.filter(
-                            channel =>
-                                channel.type ===
-                                ChannelType.GuildText
-                        );
-
-                    for (
-                        const channel of channels.values()
-                    ) {
-
-                        await channel.permissionOverwrites.edit(
-                            member.guild.roles.everyone,
-                            {
-                                SendMessages: null
-                            },
-                            {
-                                reason:
-                                    "Automatic anti-raid unlock"
-                            }
-                        );
-                    }
-
-                    joinTracker.delete(
-                        guildId
-                    );
-
-                    await securityLog(
-                        member.guild,
-                        "Raid Lock Released",
-                        "Automatic raid protection has been released.",
-                        0x57F287
-                    );
-
-                } catch (error) {
-
-                    console.error(
-                        "Raid unlock error:",
-                        error
-                    );
-                }
-
-            },
-            60000
-        );
-    }
-});
-
-/* =========================================================
-   ANTI-NUKE
-========================================================= */
-
-const destructiveAuditActions = [
-    "ChannelDelete",
-    "RoleDelete",
-    "GuildBanAdd",
-    "ChannelCreate",
-    "RoleCreate"
-];
-
-const auditTracker = new Map();
-
-async function processAuditSecurity(
-    guild,
-    executorId,
-    action
-) {
-
-    if (!SECURITY.antiNuke) return;
-
-    if (executorId === client.user.id) {
-        return;
-    }
-
-    if (executorId === OWNER_ID) {
-        return;
-    }
-
-    const key =
-        `${guild.id}:${executorId}`;
-
-    const now =
-        Date.now();
-
-    let actions =
-        auditTracker.get(key) || [];
-
-    actions.push({
-        action,
-        timestamp: now
-    });
-
-    actions =
-        actions.filter(
-            entry =>
-                now - entry.timestamp <
-                30000
-        );
-
-    auditTracker.set(
-        key,
-        actions
-    );
-
-    if (actions.length < 3) {
-        return;
-    }
-
-    let member =
-        guild.members.cache.get(
-            executorId
-        );
-
-    if (!member) {
-
-        member =
-            await guild.members
-                .fetch(executorId)
-                .catch(() => null);
-    }
-
-    if (!member) return;
-
-    /*
-       Remove dangerous permissions from the suspected
-       account instead of automatically banning them.
-    */
-
-    try {
-
-        const dangerousRoles =
-            member.roles.cache.filter(
-                role =>
-                    role.editable &&
-                    role.permissions.has(
-                        PermissionsBitField.Flags.Administrator
-                    )
-            );
-
-        for (
-            const role of dangerousRoles.values()
-        ) {
-
-            await member.roles.remove(
-                role,
-                "Automatic anti-nuke protection"
-            );
-        }
-
-        await securityLog(
-            guild,
-            "Anti-Nuke Triggered",
-            `**User:** ${member.user.tag}\n` +
-            `**Actions:** ${actions.length}\n` +
-            `**Action:** Dangerous permissions removed`,
-            0xED4245
-        );
-
-    } catch (error) {
-
-        console.error(
-            "Anti-nuke response error:",
-            error
-        );
-    }
-
-    auditTracker.delete(key);
-}
-
-/* =========================================================
-   AUDIT LOG LISTENERS
-========================================================= */
-
-client.on("channelDelete", async channel => {
-
-    if (!channel.guild) return;
-
-    try {
-
-        const logs =
-            await channel.guild.fetchAuditLogs({
-                type: 12,
-                limit: 1
-            });
-
-        const entry =
-            logs.entries.first();
-
-        if (!entry) return;
-
-        if (
-            Date.now() -
-            entry.createdTimestamp >
-            10000
-        ) {
-            return;
-        }
-
-        await processAuditSecurity(
-            channel.guild,
-            entry.executor.id,
-            "ChannelDelete"
-        );
-
-        await securityLog(
-            channel.guild,
-            "Channel Deleted",
-            `**Channel:** ${channel.name}\n` +
-            `**Executor:** ${entry.executor.tag}`,
-            0xED4245
-        );
-
-    } catch (error) {
-
-        console.error(
-            "Channel delete audit error:",
-            error
-        );
-    }
-});
-
-client.on("roleDelete", async role => {
-
-    if (!role.guild) return;
-
-    try {
-
-        const logs =
-            await role.guild.fetchAuditLogs({
-                type: 32,
-                limit: 1
-            });
-
-        const entry =
-            logs.entries.first();
-
-        if (!entry) return;
-
-        if (
-            Date.now() -
-            entry.createdTimestamp >
-            10000
-        ) {
-            return;
-        }
-
-        await processAuditSecurity(
-            role.guild,
-            entry.executor.id,
-            "RoleDelete"
-        );
-
-        await securityLog(
-            role.guild,
-            "Role Deleted",
-            `**Role:** ${role.name}\n` +
-            `**Executor:** ${entry.executor.tag}`,
-            0xED4245
-        );
-
-    } catch (error) {
-
-        console.error(
-            "Role delete audit error:",
-            error
-        );
-    }
-});
-
-/* =========================================================
-   CHANNEL CREATE LOGGING
-========================================================= */
-
-client.on("channelCreate", async channel => {
-
-    if (!channel.guild) return;
-
-    await securityLog(
-        channel.guild,
-        "Channel Created",
-        `**Channel:** ${channel.name}\n` +
-        `**Type:** ${channel.type}`,
-        0x57F287
-    );
-});
-
-/* =========================================================
-   ROLE CREATE LOGGING
-========================================================= */
-
-client.on("roleCreate", async role => {
-
-    if (!role.guild) return;
-
-    await securityLog(
-        role.guild,
-        "Role Created",
-        `**Role:** ${role.name}\n` +
-        `**ID:** ${role.id}`,
-        0x57F287
-    );
-});
-
-/* =========================================================
-   MEMBER BAN LOGGING
-========================================================= */
-
-client.on("guildBanAdd", async ban => {
-
-    await securityLog(
-        ban.guild,
-        "Member Banned",
-        `**User:** ${ban.user.tag}\n` +
-        `**ID:** ${ban.user.id}`,
-        0xED4245
-    );
-
-    try {
-
-        const logs =
-            await ban.guild.fetchAuditLogs({
-                type: 22,
-                limit: 1
-            });
-
-        const entry =
-            logs.entries.first();
-
-        if (!entry) return;
-
-        if (
-            Date.now() -
-            entry.createdTimestamp >
-            10000
-        ) {
-            return;
-        }
-
-        await processAuditSecurity(
-            ban.guild,
-            entry.executor.id,
-            "GuildBanAdd"
-        );
-
-    } catch (error) {
-
-        console.error(
-            "Ban audit error:",
-            error
-        );
-    }
-});
-
-/* =========================================================
-   CONFIGURATION COMMANDS
-========================================================= */
-
-commands.push(
+        .setDescription("Set up the application system"),
 
     new SlashCommandBuilder()
         .setName("security")
@@ -3095,353 +638,1545 @@ commands.push(
                 .setDescription("Punishment type")
                 .setRequired(true)
                 .addChoices(
-                    {
-                        name: "Timeout",
-                        value: "timeout"
-                    },
-                    {
-                        name: "Kick",
-                        value: "kick"
-                    }
+                    { name: "Timeout", value: "timeout" },
+                    { name: "Kick", value: "kick" }
                 )
         ),
 
     new SlashCommandBuilder()
         .setName("securitytest")
         .setDescription("Test the security system")
-);
+];
 
-/* =========================================================
-   IMPORTANT:
-   GLOBAL COMMAND REGISTRATION REPLACEMENT
-========================================================= */
+async function registerCommands() {
+    const rest = new REST({ version: "10" }).setToken(TOKEN);
 
-async function registerAllCommands() {
+    const commandData = commands.map(command => command.toJSON());
 
-    try {
+    console.log(`Registering ${commandData.length} global slash commands...`);
 
-        const rest =
-            new REST({
-                version: "10"
-            }).setToken(TOKEN);
+    await rest.put(
+        Routes.applicationCommands(CLIENT_ID),
+        {
+            body: commandData
+        }
+    );
 
-        const commandData =
-            commands.map(
-                command =>
-                    command.toJSON()
+    console.log("Global slash commands registered.");
+
+    for (const guild of client.guilds.cache.values()) {
+        try {
+            await rest.put(
+                Routes.applicationGuildCommands(
+                    CLIENT_ID,
+                    guild.id
+                ),
+                {
+                    body: []
+                }
             );
 
-        console.log(
-            `Registering ${commandData.length} global commands...`
-        );
-
-        await rest.put(
-            Routes.applicationCommands(
-                CLIENT_ID
-            ),
-            {
-                body: commandData
-            }
-        );
-
-        console.log(
-            `Registered ${commandData.length} global commands.`
-        );
-
-    } catch (error) {
-
-        console.error(
-            "Global registration error:",
-            error
-        );
+            console.log(
+                `Cleared old server commands from ${guild.name}`
+            );
+        } catch (error) {
+            console.error(
+                `Could not clear old commands from ${guild.name}:`,
+                error.message
+            );
+        }
     }
 }
 
-/* =========================================================
-   SECURITY COMMAND HANDLER
-========================================================= */
+async function createTicket(interaction) {
+    const guild = interaction.guild;
 
-client.on("interactionCreate", async interaction => {
-
-    if (!interaction.isChatInputCommand()) {
-        return;
+    if (!guild) {
+        return commandError(interaction, "This command can only be used in a server.");
     }
 
-    const command =
-        interaction.commandName;
+    const existing = guild.channels.cache.find(
+        channel =>
+            channel.topic === `LegacyUnlock ticket for ${interaction.user.id}`
+    );
+
+    if (existing) {
+        return interaction.reply({
+            content: `You already have a ticket: ${existing}`,
+            ephemeral: true
+        });
+    }
+
+    const category = await getOrCreateCategory(
+        guild,
+        CONFIG.ticketCategoryName
+    );
+
+    const supportRole = await getOrCreateRole(
+        guild,
+        CONFIG.supportRoleName
+    );
+
+    const channelName = `ticket-${safeChannelName(interaction.user.username)}`;
+
+    const channel = await guild.channels.create({
+        name: channelName,
+        type: ChannelType.GuildText,
+        parent: category.id,
+        topic: `LegacyUnlock ticket for ${interaction.user.id}`,
+        permissionOverwrites: [
+            {
+                id: guild.roles.everyone.id,
+                deny: [PermissionsBitField.Flags.ViewChannel]
+            },
+            {
+                id: interaction.user.id,
+                allow: [
+                    PermissionsBitField.Flags.ViewChannel,
+                    PermissionsBitField.Flags.SendMessages,
+                    PermissionsBitField.Flags.ReadMessageHistory
+                ]
+            },
+            {
+                id: supportRole.id,
+                allow: [
+                    PermissionsBitField.Flags.ViewChannel,
+                    PermissionsBitField.Flags.SendMessages,
+                    PermissionsBitField.Flags.ReadMessageHistory
+                ]
+            }
+        ]
+    });
+
+    ticketOwners.set(channel.id, interaction.user.id);
+
+    const embed = new EmbedBuilder()
+        .setTitle("LegacyUnlock Ticket")
+        .setDescription(
+            `Welcome ${interaction.user}.\n\n` +
+            "Please explain what you need help with. A member of the support team will assist you."
+        )
+        .setColor(0x5865F2)
+        .setTimestamp();
+
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId("ticket_claim")
+            .setLabel("Claim")
+            .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+            .setCustomId("ticket_close")
+            .setLabel("Close")
+            .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+            .setCustomId("ticket_delete")
+            .setLabel("Delete")
+            .setStyle(ButtonStyle.Danger)
+    );
+
+    await channel.send({
+        content: `${interaction.user} <@&${supportRole.id}>`,
+        embeds: [embed],
+        components: [row]
+    });
+
+    await interaction.reply({
+        content: `Your ticket has been created: ${channel}`,
+        ephemeral: true
+    });
+
+    await sendLog(
+        guild,
+        "Ticket Created",
+        `${interaction.user} created ${channel}.`
+    );
+}
+
+async function closeTicket(interaction) {
+    if (!interaction.channel) {
+        return commandError(interaction, "This is not a ticket channel.");
+    }
+
+    const ownerId = ticketOwners.get(interaction.channel.id);
 
     if (
-        ![
-            "security",
+        !ownerId &&
+        !interaction.channel.name.startsWith("ticket-")
+    ) {
+        return commandError(interaction, "This is not a ticket channel.");
+    }
+
+    if (
+        interaction.user.id !== ownerId &&
+        !isStaff(interaction.member)
+    ) {
+        return commandError(interaction, "You cannot close this ticket.");
+    }
+
+    await interaction.channel.permissionOverwrites.edit(
+        ownerId,
+        {
+            SendMessages: false
+        }
+    ).catch(() => {});
+
+    await interaction.reply(
+        "🔒 This ticket has been closed."
+    );
+
+    await sendLog(
+        interaction.guild,
+        "Ticket Closed",
+        `${interaction.user} closed ${interaction.channel}.`
+    );
+}
+
+async function deleteTicket(interaction) {
+    if (!interaction.channel) {
+        return commandError(interaction, "This is not a ticket channel.");
+    }
+
+    const ownerId = ticketOwners.get(interaction.channel.id);
+
+    if (
+        interaction.user.id !== ownerId &&
+        !isStaff(interaction.member)
+    ) {
+        return commandError(interaction, "You cannot delete this ticket.");
+    }
+
+    await interaction.reply("🗑️ Deleting this ticket...");
+
+    await sendLog(
+        interaction.guild,
+        "Ticket Deleted",
+        `${interaction.user} deleted #${interaction.channel.name}.`
+    );
+
+    setTimeout(() => {
+        interaction.channel.delete().catch(() => {});
+    }, 1000);
+}
+
+async function claimTicket(interaction) {
+    if (!interaction.channel) {
+        return commandError(interaction, "This is not a ticket channel.");
+    }
+
+    if (!isStaff(interaction.member)) {
+        return commandError(interaction, "Only staff can claim tickets.");
+    }
+
+    ticketClaims.set(
+        interaction.channel.id,
+        interaction.user.id
+    );
+
+    await interaction.reply(
+        `📌 ${interaction.user} has claimed this ticket.`
+    );
+
+    await sendLog(
+        interaction.guild,
+        "Ticket Claimed",
+        `${interaction.user} claimed #${interaction.channel.name}.`
+    );
+}
+
+async function startApplication(interaction, roleName) {
+    const questions = ROLE_TESTS[roleName];
+
+    if (!questions) {
+        return commandError(interaction, "Invalid application type.");
+    }
+
+    const key = `${interaction.guild.id}:${interaction.user.id}`;
+
+    if (applications.has(key)) {
+        return commandError(
+            interaction,
+            "You already have an active application."
+        );
+    }
+
+    applications.set(key, {
+        role: roleName,
+        index: 0,
+        answers: [],
+        questions
+    });
+
+    const firstQuestion = questions[0];
+
+    const modal = new ModalBuilder()
+        .setCustomId(`application_answer_${roleName}_0`)
+        .setTitle(`Application: ${roleName}`);
+
+    const input = new TextInputBuilder()
+        .setCustomId("answer")
+        .setLabel(firstQuestion.slice(0, 45))
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true)
+        .setMaxLength(1000)
+        .setPlaceholder("Enter your answer...");
+
+    modal.addComponents(
+        new ActionRowBuilder().addComponents(input)
+    );
+
+    await interaction.showModal(modal);
+}
+
+async function finishApplication(interaction, data) {
+    const scores = data.answers.map(rateAnswer);
+    const total = scores.reduce((a, b) => a + b, 0);
+    const average = Math.round(
+        (total / scores.length) * 100
+    ) / 100;
+
+    const passed =
+        average >= CONFIG.minimumPassingScore;
+
+    const role = await getOrCreateRole(
+        interaction.guild,
+        data.role
+    );
+
+    if (passed) {
+        const member = await interaction.guild.members.fetch(
+            interaction.user.id
+        ).catch(() => null);
+
+        if (member) {
+            await member.roles.add(
+                role,
+                "LegacyUnlock application passed"
+            ).catch(() => {});
+        }
+    }
+
+    applications.delete(
+        `${interaction.guild.id}:${interaction.user.id}`
+    );
+
+    const embed = new EmbedBuilder()
+        .setTitle("Application Complete")
+        .setColor(passed ? 0x57F287 : 0xED4245)
+        .setDescription(
+            `**Role:** ${data.role}\n` +
+            `**Score:** ${average}/10\n` +
+            `**Required:** ${CONFIG.minimumPassingScore}/10\n\n` +
+            (
+                passed
+                    ? `✅ You passed and received the **${role.name}** role.`
+                    : "❌ You did not reach the required score."
+            )
+        )
+        .setTimestamp();
+
+    await interaction.reply({
+        embeds: [embed],
+        ephemeral: true
+    });
+
+    await sendLog(
+        interaction.guild,
+        "Application Completed",
+        `${interaction.user} applied for ${data.role} and scored ${average}/10.`
+    );
+}
+
+async function handleApplicationModal(interaction) {
+    const parts = interaction.customId.split("_");
+
+    const roleName = parts[2];
+    const index = Number(parts[3]);
+
+    const key = `${interaction.guild.id}:${interaction.user.id}`;
+    const data = applications.get(key);
+
+    if (!data) {
+        return interaction.reply({
+            content: "This application has expired. Please start again.",
+            ephemeral: true
+        });
+    }
+
+    const answer = interaction.fields.getTextInputValue("answer");
+
+    data.answers.push(answer);
+
+    const nextIndex = index + 1;
+
+    if (nextIndex >= data.questions.length) {
+        return finishApplication(interaction, data);
+    }
+
+    data.index = nextIndex;
+
+    const modal = new ModalBuilder()
+        .setCustomId(
+            `application_answer_${roleName}_${nextIndex}`
+        )
+        .setTitle(
+            `Application ${nextIndex + 1}/${data.questions.length}`
+        );
+
+    const input = new TextInputBuilder()
+        .setCustomId("answer")
+        .setLabel(
+            data.questions[nextIndex].slice(0, 45)
+        )
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(true)
+        .setMaxLength(1000)
+        .setPlaceholder("Enter your answer...");
+
+    modal.addComponents(
+        new ActionRowBuilder().addComponents(input)
+    );
+
+    await interaction.showModal(modal);
+}
+
+async function createApplicationPanel(interaction) {
+    const embed = new EmbedBuilder()
+        .setTitle("LegacyUnlock Applications")
+        .setDescription(
+            "Select the position you want to apply for below."
+        )
+        .setColor(0x5865F2);
+
+    const menu = new StringSelectMenuBuilder()
+        .setCustomId("application_select")
+        .setPlaceholder("Choose an application")
+        .addOptions(
+            new StringSelectMenuOptionBuilder()
+                .setLabel("Tester")
+                .setDescription("Apply for Tester")
+                .setValue("tester"),
+            new StringSelectMenuOptionBuilder()
+                .setLabel("Moderator")
+                .setDescription("Apply for Moderator")
+                .setValue("moderator"),
+            new StringSelectMenuOptionBuilder()
+                .setLabel("Support")
+                .setDescription("Apply for Support")
+                .setValue("support"),
+            new StringSelectMenuOptionBuilder()
+                .setLabel("Developer")
+                .setDescription("Apply for Developer")
+                .setValue("developer")
+        );
+
+    await interaction.channel.send({
+        embeds: [embed],
+        components: [
+            new ActionRowBuilder().addComponents(menu)
+        ]
+    });
+
+    await interaction.reply({
+        content: "Application panel created.",
+        ephemeral: true
+    });
+}
+
+async function setupServer(interaction) {
+    await getOrCreateRole(
+        interaction.guild,
+        CONFIG.supportRoleName
+    );
+
+    await getOrCreateRole(
+        interaction.guild,
+        CONFIG.adminRoleName
+    );
+
+    await getOrCreateRole(
+        interaction.guild,
+        CONFIG.moderatorRoleName
+    );
+
+    await getOrCreateCategory(
+        interaction.guild,
+        CONFIG.ticketCategoryName
+    );
+
+    await getOrCreateCategory(
+        interaction.guild,
+        CONFIG.applicationCategoryName
+    );
+
+    await getOrCreateLogChannel(
+        interaction.guild
+    );
+
+    await interaction.reply({
+        content:
+            "✅ LegacyUnlock setup has been completed.\n\n" +
+            "Created/verified:\n" +
+            `• ${CONFIG.supportRoleName}\n` +
+            `• ${CONFIG.adminRoleName}\n` +
+            `• ${CONFIG.moderatorRoleName}\n` +
+            `• ${CONFIG.ticketCategoryName}\n` +
+            `• ${CONFIG.applicationCategoryName}\n` +
+            `• ${CONFIG.logChannelName}`,
+        ephemeral: true
+    });
+}
+
+async function handleCommand(interaction) {
+    const name = interaction.commandName;
+
+    if (!interaction.guild && name !== "ping" && name !== "botinfo") {
+        return commandError(
+            interaction,
+            "This command must be used inside a server."
+        );
+    }
+
+    if (name === "ping") {
+        return interaction.reply(
+            `🏓 Pong! WebSocket latency: ${client.ws.ping}ms`
+        );
+    }
+
+    if (name === "botinfo") {
+        const embed = new EmbedBuilder()
+            .setTitle(CONFIG.botName)
+            .setColor(0x5865F2)
+            .addFields(
+                {
+                    name: "Servers",
+                    value: String(client.guilds.cache.size),
+                    inline: true
+                },
+                {
+                    name: "Users",
+                    value: String(
+                        client.guilds.cache.reduce(
+                            (total, guild) =>
+                                total + (guild.memberCount || 0),
+                            0
+                        )
+                    ),
+                    inline: true
+                },
+                {
+                    name: "Commands",
+                    value: String(commands.length),
+                    inline: true
+                }
+            )
+            .setTimestamp();
+
+        return interaction.reply({ embeds: [embed] });
+    }
+
+    if (name === "setwelcome") {
+        if (!hasAdmin(interaction)) {
+            return commandError(interaction, "Administrator permission required.");
+        }
+
+        const channel = interaction.options.getChannel("channel");
+
+        welcomeChannels.set(
+            interaction.guild.id,
+            channel.id
+        );
+
+        await interaction.reply({
+            content: `Welcome messages will now be sent in ${channel}.`,
+            ephemeral: true
+        });
+
+        return sendLog(
+            interaction.guild,
+            "Welcome Channel Updated",
+            `${interaction.user} set the welcome channel to ${channel}.`
+        );
+    }
+
+    if (name === "serverinfo") {
+        const guild = interaction.guild;
+
+        const embed = new EmbedBuilder()
+            .setTitle(guild.name)
+            .setColor(0x5865F2)
+            .setThumbnail(guild.iconURL({ size: 512 }))
+            .addFields(
+                {
+                    name: "Owner",
+                    value: `<@${guild.ownerId}>`,
+                    inline: true
+                },
+                {
+                    name: "Members",
+                    value: String(guild.memberCount),
+                    inline: true
+                },
+                {
+                    name: "Channels",
+                    value: String(guild.channels.cache.size),
+                    inline: true
+                },
+                {
+                    name: "Roles",
+                    value: String(guild.roles.cache.size),
+                    inline: true
+                },
+                {
+                    name: "Created",
+                    value: `<t:${Math.floor(guild.createdTimestamp / 1000)}:F>`,
+                    inline: false
+                }
+            );
+
+        return interaction.reply({ embeds: [embed] });
+    }
+
+    if (name === "userinfo") {
+        const user =
+            interaction.options.getUser("user") ||
+            interaction.user;
+
+        const member =
+            await interaction.guild.members
+                .fetch(user.id)
+                .catch(() => null);
+
+        const embed = new EmbedBuilder()
+            .setTitle(user.username)
+            .setThumbnail(user.displayAvatarURL({ size: 512 }))
+            .setColor(0x5865F2)
+            .addFields(
+                {
+                    name: "User ID",
+                    value: user.id,
+                    inline: true
+                },
+                {
+                    name: "Bot",
+                    value: user.bot ? "Yes" : "No",
+                    inline: true
+                },
+                {
+                    name: "Joined Server",
+                    value: member?.joinedTimestamp
+                        ? `<t:${Math.floor(member.joinedTimestamp / 1000)}:F>`
+                        : "Unknown",
+                    inline: false
+                }
+            );
+
+        return interaction.reply({ embeds: [embed] });
+    }
+
+    if (name === "avatar") {
+        const user =
+            interaction.options.getUser("user") ||
+            interaction.user;
+
+        const embed = new EmbedBuilder()
+            .setTitle(`${user.username}'s Avatar`)
+            .setImage(user.displayAvatarURL({ size: 1024 }))
+            .setColor(0x5865F2);
+
+        return interaction.reply({ embeds: [embed] });
+    }
+
+    if (name === "help") {
+        const embed = new EmbedBuilder()
+            .setTitle("LegacyUnlock Commands")
+            .setColor(0x5865F2)
+            .addFields(
+                {
+                    name: "General",
+                    value:
+                        "`/ping` `/botinfo` `/serverinfo` `/userinfo` `/avatar` `/help` `/setwelcome`"
+                },
+                {
+                    name: "Moderation",
+                    value:
+                        "`/kick` `/ban` `/unban` `/timeout` `/warn` `/clear`"
+                },
+                {
+                    name: "Tickets",
+                    value:
+                        "`/ticketpanel` `/ticket` `/ticketclose` `/ticketdelete` `/ticketclaim`"
+                },
+                {
+                    name: "Applications",
+                    value:
+                        "`/apply` `/applicationpanel` `/applications`"
+                },
+                {
+                    name: "Setup",
+                    value:
+                        "`/setup` `/setlogs` `/setuptickets` `/setupapplications`"
+                },
+                {
+                    name: "Security",
+                    value:
+                        "`/security` `/antispam` `/antilink` `/antislur` `/antiraid` `/antinuke` `/setpunishment` `/securitytest`"
+                }
+            );
+
+        return interaction.reply({ embeds: [embed] });
+    }
+
+    if (name === "kick") {
+        if (!hasModeration(interaction)) {
+            return commandError(interaction, "Moderation permission required.");
+        }
+
+        const user = interaction.options.getUser("user");
+        const reason =
+            interaction.options.getString("reason") ||
+            "No reason provided.";
+
+        const member =
+            await interaction.guild.members
+                .fetch(user.id)
+                .catch(() => null);
+
+        if (!member) {
+            return commandError(interaction, "That member is not in this server.");
+        }
+
+        if (!member.kickable) {
+            return commandError(interaction, "I cannot kick that member.");
+        }
+
+        await member.kick(reason);
+
+        await interaction.reply(
+            `👢 ${user.tag} was kicked.\nReason: ${reason}`
+        );
+
+        return sendLog(
+            interaction.guild,
+            "Member Kicked",
+            `${interaction.user} kicked ${user}.\nReason: ${reason}`
+        );
+    }
+
+    if (name === "ban") {
+        if (!hasModeration(interaction)) {
+            return commandError(interaction, "Moderation permission required.");
+        }
+
+        const user = interaction.options.getUser("user");
+        const reason =
+            interaction.options.getString("reason") ||
+            "No reason provided.";
+
+        const member =
+            await interaction.guild.members
+                .fetch(user.id)
+                .catch(() => null);
+
+        if (member && !member.bannable) {
+            return commandError(interaction, "I cannot ban that member.");
+        }
+
+        await interaction.guild.members.ban(
+            user.id,
+            { reason }
+        );
+
+        await interaction.reply(
+            `🔨 ${user.tag} was banned.\nReason: ${reason}`
+        );
+
+        return sendLog(
+            interaction.guild,
+            "Member Banned",
+            `${interaction.user} banned ${user}.\nReason: ${reason}`
+        );
+    }
+
+    if (name === "unban") {
+        if (!hasModeration(interaction)) {
+            return commandError(interaction, "Moderation permission required.");
+        }
+
+        const userId =
+            interaction.options.getString("userid");
+
+        try {
+            const ban =
+                await interaction.guild.bans.fetch(userId);
+
+            await interaction.guild.members.unban(
+                userId,
+                `Unbanned by ${interaction.user.tag}`
+            );
+
+            return interaction.reply(
+                `✅ ${ban.user.tag} has been unbanned.`
+            );
+        } catch {
+            return commandError(
+                interaction,
+                "That user is not banned or the ID is invalid."
+            );
+        }
+    }
+
+    if (name === "timeout") {
+        if (!hasModeration(interaction)) {
+            return commandError(interaction, "Moderation permission required.");
+        }
+
+        const user = interaction.options.getUser("user");
+        const minutes =
+            interaction.options.getInteger("minutes");
+
+        const reason =
+            interaction.options.getString("reason") ||
+            "No reason provided.";
+
+        const member =
+            await interaction.guild.members
+                .fetch(user.id)
+                .catch(() => null);
+
+        if (!member) {
+            return commandError(interaction, "That member is not in this server.");
+        }
+
+        if (!member.moderatable) {
+            return commandError(interaction, "I cannot timeout that member.");
+        }
+
+        await member.timeout(
+            minutes * 60 * 1000,
+            reason
+        );
+
+        await interaction.reply(
+            `⏱️ ${user.tag} was timed out for ${minutes} minute(s).\nReason: ${reason}`
+        );
+
+        return sendLog(
+            interaction.guild,
+            "Member Timed Out",
+            `${interaction.user} timed out ${user} for ${minutes} minute(s).\nReason: ${reason}`
+        );
+    }
+
+    if (name === "warn") {
+        if (!hasModeration(interaction)) {
+            return commandError(interaction, "Moderation permission required.");
+        }
+
+        const user = interaction.options.getUser("user");
+        const reason =
+            interaction.options.getString("reason");
+
+        const key =
+            `${interaction.guild.id}:${user.id}`;
+
+        const list =
+            warnings.get(key) || [];
+
+        list.push({
+            reason,
+            moderator: interaction.user.id,
+            timestamp: Date.now()
+        });
+
+        warnings.set(key, list);
+
+        await interaction.reply(
+            `⚠️ ${user.tag} has been warned.\nReason: ${reason}`
+        );
+
+        return sendLog(
+            interaction.guild,
+            "Member Warned",
+            `${interaction.user} warned ${user}.\nReason: ${reason}`
+        );
+    }
+
+    if (name === "clear") {
+        if (!hasModeration(interaction)) {
+            return commandError(interaction, "Moderation permission required.");
+        }
+
+        const amount =
+            interaction.options.getInteger("amount");
+
+        if (!interaction.channel?.isTextBased()) {
+            return commandError(interaction, "This command cannot be used here.");
+        }
+
+        const deleted =
+            await interaction.channel.bulkDelete(
+                amount,
+                true
+            );
+
+        return interaction.reply({
+            content: `🧹 Deleted ${deleted.size} message(s).`,
+            ephemeral: true
+        });
+    }
+
+    if (name === "ticket") {
+        return createTicket(interaction);
+    }
+
+    if (name === "ticketpanel") {
+        if (!hasAdmin(interaction)) {
+            return commandError(interaction, "Administrator permission required.");
+        }
+
+        const embed = new EmbedBuilder()
+            .setTitle("LegacyUnlock Support")
+            .setDescription(
+                "Need help? Click the button below to create a private support ticket."
+            )
+            .setColor(0x5865F2);
+
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId("ticket_create")
+                .setLabel("Create Ticket")
+                .setStyle(ButtonStyle.Primary)
+        );
+
+        await interaction.channel.send({
+            embeds: [embed],
+            components: [row]
+        });
+
+        return interaction.reply({
+            content: "Ticket panel created.",
+            ephemeral: true
+        });
+    }
+
+    if (name === "ticketclose") {
+        return closeTicket(interaction);
+    }
+
+    if (name === "ticketdelete") {
+        return deleteTicket(interaction);
+    }
+
+    if (name === "ticketclaim") {
+        return claimTicket(interaction);
+    }
+
+    if (name === "apply") {
+        const menu = new StringSelectMenuBuilder()
+            .setCustomId("application_select")
+            .setPlaceholder("Choose an application")
+            .addOptions(
+                new StringSelectMenuOptionBuilder()
+                    .setLabel("Tester")
+                    .setDescription("Apply for Tester")
+                    .setValue("tester"),
+                new StringSelectMenuOptionBuilder()
+                    .setLabel("Moderator")
+                    .setDescription("Apply for Moderator")
+                    .setValue("moderator"),
+                new StringSelectMenuOptionBuilder()
+                    .setLabel("Support")
+                    .setDescription("Apply for Support")
+                    .setValue("support"),
+                new StringSelectMenuOptionBuilder()
+                    .setLabel("Developer")
+                    .setDescription("Apply for Developer")
+                    .setValue("developer")
+            );
+
+        return interaction.reply({
+            content: "Choose the position you want to apply for.",
+            components: [
+                new ActionRowBuilder().addComponents(menu)
+            ],
+            ephemeral: true
+        });
+    }
+
+    if (name === "applicationpanel") {
+        if (!hasAdmin(interaction)) {
+            return commandError(interaction, "Administrator permission required.");
+        }
+
+        return createApplicationPanel(interaction);
+    }
+
+    if (name === "applications") {
+        const embed = new EmbedBuilder()
+            .setTitle("LegacyUnlock Applications")
+            .setColor(0x5865F2)
+            .setDescription(
+                `Applications use 10 questions.\n` +
+                `Passing score: ${CONFIG.minimumPassingScore}/10.\n\n` +
+                "**Available positions:**\n" +
+                "• Tester\n" +
+                "• Moderator\n" +
+                "• Support\n" +
+                "• Developer"
+            );
+
+        return interaction.reply({ embeds: [embed] });
+    }
+
+    if (name === "setup") {
+        if (!hasAdmin(interaction)) {
+            return commandError(interaction, "Administrator permission required.");
+        }
+
+        return setupServer(interaction);
+    }
+
+    if (name === "setlogs") {
+        if (!hasAdmin(interaction)) {
+            return commandError(interaction, "Administrator permission required.");
+        }
+
+        await getOrCreateLogChannel(interaction.guild);
+
+        return interaction.reply({
+            content: `✅ ${CONFIG.logChannelName} is ready.`,
+            ephemeral: true
+        });
+    }
+
+    if (name === "setuptickets") {
+        if (!hasAdmin(interaction)) {
+            return commandError(interaction, "Administrator permission required.");
+        }
+
+        await getOrCreateCategory(
+            interaction.guild,
+            CONFIG.ticketCategoryName
+        );
+
+        await getOrCreateRole(
+            interaction.guild,
+            CONFIG.supportRoleName
+        );
+
+        return interaction.reply({
+            content: "✅ Ticket system is ready.",
+            ephemeral: true
+        });
+    }
+
+    if (name === "setupapplications") {
+        if (!hasAdmin(interaction)) {
+            return commandError(interaction, "Administrator permission required.");
+        }
+
+        await getOrCreateCategory(
+            interaction.guild,
+            CONFIG.applicationCategoryName
+        );
+
+        return interaction.reply({
+            content: "✅ Application system is ready.",
+            ephemeral: true
+        });
+    }
+
+    if (name === "security") {
+        if (!hasAdmin(interaction)) {
+            return commandError(interaction, "Administrator permission required.");
+        }
+
+        const embed = new EmbedBuilder()
+            .setTitle("LegacyUnlock Security")
+            .setColor(0x5865F2)
+            .addFields(
+                {
+                    name: "Anti-Spam",
+                    value: SECURITY.antiSpam ? "Enabled" : "Disabled",
+                    inline: true
+                },
+                {
+                    name: "Anti-Link",
+                    value: SECURITY.antiLinks ? "Enabled" : "Disabled",
+                    inline: true
+                },
+                {
+                    name: "Anti-Slur",
+                    value: SECURITY.antiSlurs ? "Enabled" : "Disabled",
+                    inline: true
+                },
+                {
+                    name: "Anti-Raid",
+                    value: SECURITY.antiRaid ? "Enabled" : "Disabled",
+                    inline: true
+                },
+                {
+                    name: "Anti-Nuke",
+                    value: SECURITY.antiNuke ? "Enabled" : "Disabled",
+                    inline: true
+                },
+                {
+                    name: "Punishment",
+                    value: SECURITY.punishment,
+                    inline: true
+                }
+            );
+
+        return interaction.reply({ embeds: [embed] });
+    }
+
+    if (
+        [
             "antispam",
             "antilink",
             "antislur",
             "antiraid",
-            "antinuke",
-            "setpunishment",
-            "securitytest"
-        ].includes(command)
+            "antinuke"
+        ].includes(name)
     ) {
-        return;
-    }
+        if (!hasAdmin(interaction)) {
+            return commandError(interaction, "Administrator permission required.");
+        }
 
-    if (!hasAdmin(interaction)) {
+        const enabled =
+            interaction.options.getBoolean("enabled");
 
-        return interaction.reply({
+        if (name === "antispam") SECURITY.antiSpam = enabled;
+        if (name === "antilink") SECURITY.antiLinks = enabled;
+        if (name === "antislur") SECURITY.antiSlurs = enabled;
+        if (name === "antiraid") SECURITY.antiRaid = enabled;
+        if (name === "antinuke") SECURITY.antiNuke = enabled;
+
+        await interaction.reply({
             content:
-                "You need Administrator permission to use this command.",
+                `✅ ${name} has been ${enabled ? "enabled" : "disabled"}.`,
             ephemeral: true
         });
+
+        return sendLog(
+            interaction.guild,
+            "Security Setting Changed",
+            `${interaction.user} changed ${name} to ${enabled}.`
+        );
     }
 
-    /* =========================
-       SECURITY STATUS
-    ========================= */
-
-    if (command === "security") {
-
-        const embed =
-            new EmbedBuilder()
-                .setTitle("Security System")
-                .addFields(
-                    {
-                        name: "Anti-Spam",
-                        value:
-                            SECURITY.antiSpam
-                                ? "Enabled"
-                                : "Disabled",
-                        inline: true
-                    },
-                    {
-                        name: "Anti-Link",
-                        value:
-                            SECURITY.antiLinks
-                                ? "Enabled"
-                                : "Disabled",
-                        inline: true
-                    },
-                    {
-                        name: "Anti-Slur",
-                        value:
-                            SECURITY.antiSlurs
-                                ? "Enabled"
-                                : "Disabled",
-                        inline: true
-                    },
-                    {
-                        name: "Anti-Raid",
-                        value:
-                            SECURITY.antiRaid
-                                ? "Enabled"
-                                : "Disabled",
-                        inline: true
-                    },
-                    {
-                        name: "Anti-Nuke",
-                        value:
-                            SECURITY.antiNuke
-                                ? "Enabled"
-                                : "Disabled",
-                        inline: true
-                    },
-                    {
-                        name: "Punishment",
-                        value:
-                            SECURITY.punishment,
-                        inline: true
-                    }
-                )
-                .setColor(0x5865F2);
-
-        return interaction.reply({
-            embeds: [embed],
-            ephemeral: true
-        });
-    }
-
-    /* =========================
-       ANTI-SPAM
-    ========================= */
-
-    if (command === "antispam") {
-
-        SECURITY.antiSpam =
-            interaction.options.getBoolean(
-                "enabled"
-            );
-
-        return interaction.reply({
-            content:
-                `Anti-spam is now **${
-                    SECURITY.antiSpam
-                        ? "enabled"
-                        : "disabled"
-                }**.`,
-            ephemeral: true
-        });
-    }
-
-    /* =========================
-       ANTI-LINK
-    ========================= */
-
-    if (command === "antilink") {
-
-        SECURITY.antiLinks =
-            interaction.options.getBoolean(
-                "enabled"
-            );
-
-        return interaction.reply({
-            content:
-                `Anti-link is now **${
-                    SECURITY.antiLinks
-                        ? "enabled"
-                        : "disabled"
-                }**.`,
-            ephemeral: true
-        });
-    }
-
-    /* =========================
-       ANTI-SLUR
-    ========================= */
-
-    if (command === "antislur") {
-
-        SECURITY.antiSlurs =
-            interaction.options.getBoolean(
-                "enabled"
-            );
-
-        return interaction.reply({
-            content:
-                `Anti-slur is now **${
-                    SECURITY.antiSlurs
-                        ? "enabled"
-                        : "disabled"
-                }**.`,
-            ephemeral: true
-        });
-    }
-
-    /* =========================
-       ANTI-RAID
-    ========================= */
-
-    if (command === "antiraid") {
-
-        SECURITY.antiRaid =
-            interaction.options.getBoolean(
-                "enabled"
-            );
-
-        return interaction.reply({
-            content:
-                `Anti-raid is now **${
-                    SECURITY.antiRaid
-                        ? "enabled"
-                        : "disabled"
-                }**.`,
-            ephemeral: true
-        });
-    }
-
-    /* =========================
-       ANTI-NUKE
-    ========================= */
-
-    if (command === "antinuke") {
-
-        SECURITY.antiNuke =
-            interaction.options.getBoolean(
-                "enabled"
-            );
-
-        return interaction.reply({
-            content:
-                `Anti-nuke is now **${
-                    SECURITY.antiNuke
-                        ? "enabled"
-                        : "disabled"
-                }**.`,
-            ephemeral: true
-        });
-    }
-
-    /* =========================
-       PUNISHMENT
-    ========================= */
-
-    if (command === "setpunishment") {
+    if (name === "setpunishment") {
+        if (!hasAdmin(interaction)) {
+            return commandError(interaction, "Administrator permission required.");
+        }
 
         SECURITY.punishment =
-            interaction.options.getString(
-                "type"
-            );
+            interaction.options.getString("type");
 
         return interaction.reply({
             content:
-                `Automatic security punishment set to **${SECURITY.punishment}**.`,
+                `✅ Security punishment set to **${SECURITY.punishment}**.`,
             ephemeral: true
         });
     }
 
-    /* =========================
-       SECURITY TEST
-    ========================= */
-
-    if (command === "securitytest") {
-
-        await securityLog(
-            interaction.guild,
-            "Security Test",
-            `Security test executed by **${interaction.user.tag}**.`,
-            0x57F287
-        );
+    if (name === "securitytest") {
+        if (!hasAdmin(interaction)) {
+            return commandError(interaction, "Administrator permission required.");
+        }
 
         return interaction.reply({
             content:
-                "Security logging test completed. Check the bot-logs channel.",
-            ephemeral: true
+                "🛡️ Security test successful.\n\n" +
+                `Anti-Spam: ${SECURITY.antiSpam ? "ON" : "OFF"}\n` +
+                `Anti-Link: ${SECURITY.antiLinks ? "ON" : "OFF"}\n` +
+                `Anti-Slur: ${SECURITY.antiSlurs ? "ON" : "OFF"}\n` +
+                `Anti-Raid: ${SECURITY.antiRaid ? "ON" : "OFF"}\n` +
+                `Anti-Nuke: ${SECURITY.antiNuke ? "ON" : "OFF"}`
         });
     }
-});
-
-/* =========================================================
-   STARTUP OVERRIDE
-========================================================= */
+}
 
 client.once("ready", async () => {
+    console.log("");
+    console.log("================================");
+    console.log("LegacyUnlock is online.");
+    console.log(`Logged in as ${client.user.tag}`);
+    console.log(`Bot ID: ${client.user.id}`);
+    console.log(`Servers: ${client.guilds.cache.size}`);
+    console.log("================================");
+    console.log("");
 
-    await registerAllCommands();
+    client.user.setPresence({
+        activities: [
+            {
+                name: `${client.guilds.cache.size} servers`,
+                type: 3
+            }
+        ],
+        status: "online"
+    });
 
+    try {
+        await registerCommands();
+    } catch (error) {
+        console.error("COMMAND REGISTRATION FAILED:");
+        console.error(error);
+    }
+
+    for (const guild of client.guilds.cache.values()) {
+        try {
+            await getOrCreateLogChannel(guild);
+        } catch (error) {
+            console.error(
+                `Could not create log channel in ${guild.name}:`,
+                error.message
+            );
+        }
+    }
+
+    console.log("Startup complete.");
+});
+
+client.on("interactionCreate", async interaction => {
+    try {
+        if (interaction.isChatInputCommand()) {
+            await handleCommand(interaction);
+            return;
+        }
+
+        if (interaction.isButton()) {
+            if (interaction.customId === "ticket_create") {
+                await createTicket(interaction);
+                return;
+            }
+
+            if (interaction.customId === "ticket_claim") {
+                await claimTicket(interaction);
+                return;
+            }
+
+            if (interaction.customId === "ticket_close") {
+                await closeTicket(interaction);
+                return;
+            }
+
+            if (interaction.customId === "ticket_delete") {
+                await deleteTicket(interaction);
+                return;
+            }
+        }
+
+        if (interaction.isStringSelectMenu()) {
+            if (interaction.customId === "application_select") {
+                await startApplication(
+                    interaction,
+                    interaction.values[0]
+                );
+                return;
+            }
+        }
+
+        if (interaction.isModalSubmit()) {
+            if (
+                interaction.customId.startsWith(
+                    "application_answer_"
+                )
+            ) {
+                await handleApplicationModal(interaction);
+                return;
+            }
+        }
+    } catch (error) {
+        console.error("Interaction error:", error);
+
+        await commandError(
+            interaction,
+            "Something went wrong while processing that request."
+        );
+    }
+});
+
+client.on("messageCreate", async message => {
+    try {
+        if (!message.guild) return;
+        if (message.author.bot) return;
+
+        const member = message.member;
+
+        if (
+            SECURITY.antiLinks &&
+            containsLink(message.content) &&
+            !isStaff(member)
+        ) {
+            if (SECURITY.deleteBadMessages) {
+                await message.delete().catch(() => {});
+            }
+
+            await punishSecurityUser(
+                member,
+                "Sending links while anti-link is enabled"
+            );
+
+            await securityLog(
+                message.guild,
+                "Anti-Link",
+                `${message.author} attempted to send a link.`
+            );
+
+            return;
+        }
+
+        if (
+            SECURITY.antiSlurs &&
+            containsBlockedWord(message.content) &&
+            !isStaff(member)
+        ) {
+            if (SECURITY.deleteBadMessages) {
+                await message.delete().catch(() => {});
+            }
+
+            await punishSecurityUser(
+                member,
+                "Using blocked language"
+            );
+
+            await securityLog(
+                message.guild,
+                "Anti-Slur",
+                `${message.author} triggered the anti-slur filter.`
+            );
+
+            return;
+        }
+
+        if (SECURITY.antiSpam && !isStaff(member)) {
+            const key =
+                `${message.guild.id}:${message.author.id}`;
+
+            const now = Date.now();
+
+            const previous =
+                spamTracker.get(key) || [];
+
+            const recent =
+                previous.filter(
+                    timestamp =>
+                        now - timestamp <
+                        SECURITY.spamTimeWindow
+                );
+
+            recent.push(now);
+
+            spamTracker.set(key, recent);
+
+            if (
+                recent.length >=
+                SECURITY.spamMessageLimit
+            ) {
+                spamTracker.set(key, []);
+
+                if (SECURITY.deleteBadMessages) {
+                    await message.delete().catch(() => {});
+                }
+
+                await punishSecurityUser(
+                    member,
+                    "Spam detected"
+                );
+
+                await securityLog(
+                    message.guild,
+                    "Anti-Spam",
+                    `${message.author} triggered anti-spam.`
+                );
+            }
+        }
+    } catch (error) {
+        console.error("messageCreate security error:", error);
+    }
+});
+
+client.on("guildMemberAdd", async member => {
+    try {
+        if (SECURITY.antiRaid) {
+            const key = member.guild.id;
+            const now = Date.now();
+
+            const joins =
+                joinTracker.get(key) || [];
+
+            const recent =
+                joins.filter(
+                    timestamp =>
+                        now - timestamp <
+                        SECURITY.raidTimeWindow
+                );
+
+            recent.push(now);
+
+            joinTracker.set(key, recent);
+
+            if (
+                recent.length >=
+                SECURITY.raidJoinLimit
+            ) {
+                await securityLog(
+                    member.guild,
+                    "Anti-Raid",
+                    `A possible raid was detected: ${recent.length} members joined within ${SECURITY.raidTimeWindow / 1000} seconds.`
+                );
+            }
+        }
+
+        const welcomeId =
+            welcomeChannels.get(member.guild.id);
+
+        if (welcomeId) {
+            const channel =
+                member.guild.channels.cache.get(
+                    welcomeId
+                );
+
+            if (channel?.isTextBased()) {
+                const embed = new EmbedBuilder()
+                    .setTitle("Welcome!")
+                    .setDescription(
+                        `Welcome ${member} to **${member.guild.name}**!`
+                    )
+                    .setThumbnail(
+                        member.user.displayAvatarURL({
+                            size: 256
+                        })
+                    )
+                    .setColor(0x57F287)
+                    .setTimestamp();
+
+                await channel.send({
+                    embeds: [embed]
+                });
+            }
+        }
+    } catch (error) {
+        console.error("guildMemberAdd error:", error);
+    }
+});
+
+client.on("guildMemberRemove", async member => {
+    try {
+        await sendLog(
+            member.guild,
+            "Member Left",
+            `${member.user.tag} left the server.`
+        );
+    } catch (error) {
+        console.error("guildMemberRemove error:", error);
+    }
+});
+
+client.on("guildCreate", async guild => {
     console.log(
-        "Security systems initialized."
+        `Joined new server: ${guild.name} (${guild.id})`
     );
 
-    console.log(
-        "Anti-spam:",
-        SECURITY.antiSpam
-    );
+    try {
+        await getOrCreateLogChannel(guild);
 
-    console.log(
-        "Anti-link:",
-        SECURITY.antiLinks
-    );
+        await sendLog(
+            guild,
+            "LegacyUnlock Added",
+            "LegacyUnlock has been added to this server."
+        );
+    } catch (error) {
+        console.error(
+            "Guild setup error:",
+            error
+        );
+    }
 
-    console.log(
-        "Anti-slur:",
-        SECURITY.antiSlurs
-    );
+    client.user.setPresence({
+        activities: [
+            {
+                name: `${client.guilds.cache.size} servers`,
+                type: 3
+            }
+        ],
+        status: "online"
+    });
+});
 
+client.on("guildDelete", guild => {
     console.log(
-        "Anti-raid:",
-        SECURITY.antiRaid
-    );
-
-    console.log(
-        "Anti-nuke:",
-        SECURITY.antiNuke
+        `Removed from server: ${guild.name} (${guild.id})`
     );
 });
+
+client.on("error", error => {
+    console.error("Discord client error:", error);
+});
+
+client.on("shardError", error => {
+    console.error("Discord shard error:", error);
+});
+
+client.on("warn", warning => {
+    console.warn("Discord warning:", warning);
+});
+
+client.on("debug", info => {
+    if (
+        info.toLowerCase().includes("4014") ||
+        info.toLowerCase().includes("disallowed intent")
+    ) {
+        console.error("");
+        console.error("DISCORD INTENT ERROR");
+        console.error(
+            "Enable Server Members Intent and Message Content Intent in the Discord Developer Portal."
+        );
+        console.error("");
+    }
+});
+
+process.on("unhandledRejection", error => {
+    console.error("Unhandled promise rejection:", error);
+});
+
+process.on("uncaughtException", error => {
+    console.error("Uncaught exception:", error);
+    process.exit(1);
+});
+
+console.log("Starting LegacyUnlock...");
+
+client.login(TOKEN)
+    .then(() => {
+        console.log("Discord login request accepted.");
+    })
+    .catch(error => {
+        console.error("");
+        console.error("DISCORD LOGIN FAILED");
+        console.error(error);
+
+        if (
+            error?.code === 4014 ||
+            String(error?.message)
+                .toLowerCase()
+                .includes("disallowed intent")
+        ) {
+            console.error("");
+            console.error(
+                "Enable these privileged intents:"
+            );
+            console.error(
+                "1. Server Members Intent"
+            );
+            console.error(
+                "2. Message Content Intent"
+            );
+            console.error(
+                "Discord Developer Portal -> Bot -> Privileged Gateway Intents"
+            );
+        }
+
+        process.exit(1);
+    });
